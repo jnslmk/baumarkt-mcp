@@ -1,0 +1,31 @@
+[project]
+name = "baumarkt-mcp"
+version = "0.1.0"
+description = "MCP server for German hardware-store (Baumarkt) product search"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "fastmcp>=3.4.4",
+    # patchright is a patched, undetected Playwright fork — a drop-in for the
+    # playwright async API that stands a chance against the bot walls that
+    # hornbach, bauhaus and globus serve a headless browser (they hand it a
+    # CAPTCHA instead of results).
+    "patchright>=1.49",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+    # obi has no bot wall — its adapter talks plain HTTP via httpx rather than
+    # driving a browser, so it doesn't pay the Xvfb/Chromium cost the other
+    # three retailers need.
+    "httpx>=0.27",
+]
+
+[project.scripts]
+baumarkt-mcp = "baumarkt_mcp.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["baumarkt_mcp", "baumarkt_mcp.retailers"]
