@@ -11,6 +11,7 @@ browser) just to build a :class:`Product`.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -106,14 +107,29 @@ _THOUSANDS_SPACE_TABLE = str.maketrans("", "", _THOUSANDS_SPACES)
 _PRICE_NUMBER_RE = re.compile(r"\d[\d.," + _THOUSANDS_SPACES + r"]*\d|\d")
 
 
-def parse_price(text: str | None) -> float | None:
-    """Parse a retailer price string into a float, handling German formatting.
+def parse_price(value: str | int | float | None) -> float | None:
+    """Parse a retailer price into a float, handling German string formatting
+    and passing a JSON-sourced numeric price straight through.
 
-    German notation uses ``,`` as the decimal separator and ``.`` as the
-    thousands separator (``"1.234,56 €"`` -> ``1234.56``); a bare
-    ``"22,95"`` -> ``22.95``. Currency symbols, whitespace and surrounding
-    text are ignored — pass the whole price string, e.g. ``"22,95 €"`` or
-    ``"UVP 1.234,56 €"``, not a pre-stripped number.
+    Accepts three shapes because retailers hand this three shapes:
+
+    - ``str``: parsed as German-formatted text, in full below.
+    - ``int``/``float``: returned as ``float(value)`` directly — no regex, no
+      locale guessing, because a number that already came out of a JSON
+      payload (schema.org's ``Offer.price`` permits a JSON Number as well as
+      Text, and adapters that read a captured API response — e.g. Bauhaus —
+      routinely get one) is already unambiguous; running it through the
+      string parser below would be pure risk for zero benefit. ``NaN`` and
+      infinity return ``None`` rather than a nonsense price. ``bool`` is
+      rejected (returns ``None``) even though it is an ``int`` subclass in
+      Python — ``parse_price(True)`` must not silently become ``1.0``.
+    - ``None``: returns ``None`` (see below).
+
+    String parsing: German notation uses ``,`` as the decimal separator and
+    ``.`` as the thousands separator (``"1.234,56 €"`` -> ``1234.56``); a
+    bare ``"22,95"`` -> ``22.95``. Currency symbols, whitespace and
+    surrounding text are ignored — pass the whole price string, e.g.
+    ``"22,95 €"`` or ``"UVP 1.234,56 €"``, not a pre-stripped number.
 
     All four retailers here are German sites, but English notation
     (``"1,234.56"``) is also handled correctly rather than silently
@@ -134,14 +150,24 @@ def parse_price(text: str | None) -> float | None:
     of the latter two instead of an ASCII space: ``"1 234,56"`` -> ``1234.56``
     regardless of which of the three that space actually is.
 
-    Returns ``None`` when `text` is ``None``, empty, or contains no
-    recognisable number at all — callers should treat that the same as "no
-    price shown" (see :class:`Product`.price), not as a parse error to
-    surface.
+    Returns ``None`` when `value` is ``None``, a ``bool``, non-finite
+    (``NaN``/infinity), or a string that is empty or contains no
+    recognisable number at all — callers should treat all of these the same
+    as "no price shown" (see :class:`Product`.price), not as a parse error
+    to surface.
     """
-    if text is None:
+    if value is None:
         return None
-    match = _PRICE_NUMBER_RE.search(text)
+    if isinstance(value, bool):
+        # bool is a subclass of int in Python - reject explicitly so
+        # parse_price(True) doesn't silently become 1.0.
+        return None
+    if isinstance(value, (int, float)):
+        result = float(value)
+        return result if math.isfinite(result) else None
+    if not isinstance(value, str):
+        return None
+    match = _PRICE_NUMBER_RE.search(value)
     if not match:
         return None
     # Space-family characters are always a thousands-grouping separator,
