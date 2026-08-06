@@ -218,9 +218,11 @@ async def wait_for_challenge_clear(page: Page, timeout_ms: int | None = None) ->
                 "this cannot be cleared automatically."
             )
 
-        on_wall = _HORNBACH_TITLE_MARKER in title or any(
-            m in title for m in _BAUHAUS_TITLE_MARKERS
-        ) or _BAUHAUS_BODY_MARKER in text
+        on_wall = (
+            _HORNBACH_TITLE_MARKER in title
+            or any(m in title for m in _BAUHAUS_TITLE_MARKERS)
+            or _BAUHAUS_BODY_MARKER in text
+        )
         if not on_wall:
             return
 

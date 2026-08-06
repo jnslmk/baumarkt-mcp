@@ -504,7 +504,9 @@ async def search(
             page_num = 1
             while len(results) < max_results and page_num <= _MAX_SEARCH_PAGES:
                 url = _build_search_url(query, page_num)
-                await page.goto(url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+                await page.goto(
+                    url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
+                )
                 await wait_for_challenge_clear(page)
                 try:
                     await page.wait_for_selector(
@@ -574,7 +576,9 @@ async def get_product(
         page = await ctx.new_page()
         try:
             lookup_url = _build_search_url(product_id)
-            await page.goto(lookup_url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+            await page.goto(
+                lookup_url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
+            )
             await wait_for_challenge_clear(page)
 
             if not _looks_like_pdp_url(page.url):
@@ -604,7 +608,9 @@ async def get_product(
                 if not href or not isinstance(href, str):
                     return None
                 pdp_url = urljoin(BASE_URL, href)
-                await page.goto(pdp_url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+                await page.goto(
+                    pdp_url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
+                )
                 await wait_for_challenge_clear(page)
 
             return await _parse_pdp(page, product_id)
@@ -729,7 +735,9 @@ def self_check() -> None:
     }
     resolved = _resolve_variant(group, "VARIANT1")
     assert resolved is not None
-    assert resolved["name"] == "Variant One", "variant's own name must win over group name"
+    assert resolved["name"] == "Variant One", (
+        "variant's own name must win over group name"
+    )
     assert resolved["offers"]["price"] == 6.49, (
         f"variant's own price must win over any group-level default, got "
         f"{resolved['offers']['price']!r} (99.99 would mean VARIANT2's "
@@ -737,8 +745,7 @@ def self_check() -> None:
         f"direction is backwards)"
     )
     assert resolved["brand"]["name"] == "GroupBrand", (
-        "group-level fields the variant doesn't override should still "
-        "come through"
+        "group-level fields the variant doesn't override should still come through"
     )
     assert _resolve_variant(group, "NO-SUCH-SKU") is None, (
         "a non-matching id must return None, never a guessed first variant"

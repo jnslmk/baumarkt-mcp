@@ -250,8 +250,7 @@ async def search(
         if error.get("name") == "NullErgebnisSeiteError":
             return []
         raise ObiError(
-            "obi.de: search returned HTTP 404 without a recognised "
-            "no-results marker"
+            "obi.de: search returned HTTP 404 without a recognised no-results marker"
         )
 
     try:
@@ -349,9 +348,7 @@ def _first_offer(offers: Any) -> dict[str, Any]:
     return {}
 
 
-def _product_from_ld_json(
-    data: dict[str, Any], *, fallback_url: str
-) -> Product | None:
+def _product_from_ld_json(data: dict[str, Any], *, fallback_url: str) -> Product | None:
     product_id = data.get("sku")
     name = data.get("name")
     if not product_id or not name:
@@ -395,9 +392,7 @@ def _product_from_ld_json(
     )
 
 
-async def get_product(
-    product_id: str, *, store: str | None = None
-) -> Product | None:
+async def get_product(product_id: str, *, store: str | None = None) -> Product | None:
     """Fetch a single OBI product by its article number.
 
     `product_id` is OBI's article number as exposed on a `Product` this

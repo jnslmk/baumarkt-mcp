@@ -45,7 +45,12 @@ import logging
 from typing import Any
 from urllib.parse import quote
 
-from ..browser import BrowserManager, CaptchaRequired, ChallengeTimeout, wait_for_challenge_clear
+from ..browser import (
+    BrowserManager,
+    CaptchaRequired,
+    ChallengeTimeout,
+    wait_for_challenge_clear,
+)
 from ..models import Product, normalize_availability, parse_price
 
 log = logging.getLogger("baumarkt-mcp.retailers.hornbach")
@@ -157,7 +162,11 @@ def _resolve_product_object(obj: dict, target_sku: str | None) -> dict | None:
         return None
 
     raw_variants = obj.get("hasVariant")
-    variants = [v for v in raw_variants if isinstance(v, dict)] if isinstance(raw_variants, list) else []
+    variants = (
+        [v for v in raw_variants if isinstance(v, dict)]
+        if isinstance(raw_variants, list)
+        else []
+    )
     if not variants:
         return None
 
@@ -317,7 +326,9 @@ def _derive_store_pickup(offers: list[dict], store: str | None) -> bool | None:
     return availability == "InStock"
 
 
-def _product_from_ldjson(obj: dict, *, fallback_url: str | None, store: str | None) -> Product | None:
+def _product_from_ldjson(
+    obj: dict, *, fallback_url: str | None, store: str | None
+) -> Product | None:
     """Build a `Product` from one schema.org ``Product`` JSON-LD object.
 
     Returns ``None`` (rather than raising) when the object is missing a field
@@ -442,9 +453,13 @@ async def search(
                 if resolved is None:
                     continue
                 try:
-                    product = _product_from_ldjson(resolved, fallback_url=None, store=store)
+                    product = _product_from_ldjson(
+                        resolved, fallback_url=None, store=store
+                    )
                 except Exception:  # noqa: BLE001 - one bad item must not kill the search
-                    log.warning("hornbach: skipping malformed search result item", exc_info=True)
+                    log.warning(
+                        "hornbach: skipping malformed search result item", exc_info=True
+                    )
                     continue
                 if product is not None:
                     results.append(product)
@@ -492,7 +507,9 @@ async def get_product(
     async with manager.context() as ctx:
         page = await ctx.new_page()
         try:
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            response = await page.goto(
+                url, wait_until="domcontentloaded", timeout=30000
+            )
             await wait_for_challenge_clear(page)
 
             if response is not None and response.status == 404:
@@ -508,15 +525,22 @@ async def get_product(
                 group_obj = _find_first_of_type(objects, "ProductGroup")
                 if group_obj is not None:
                     target_sku = (
-                        _sku_from_url(product_id) if url == product_id else product_id.strip()
+                        _sku_from_url(product_id)
+                        if url == product_id
+                        else product_id.strip()
                     )
                     product_obj = _resolve_product_object(group_obj, target_sku)
             if product_obj is None:
-                log.info("hornbach: no Product/ProductGroup JSON-LD for product_id %r", product_id)
+                log.info(
+                    "hornbach: no Product/ProductGroup JSON-LD for product_id %r",
+                    product_id,
+                )
                 return None
 
             try:
-                return _product_from_ldjson(product_obj, fallback_url=page.url, store=store)
+                return _product_from_ldjson(
+                    product_obj, fallback_url=page.url, store=store
+                )
             except (CaptchaRequired, ChallengeTimeout):
                 # Cannot actually be raised by _product_from_ldjson (it never
                 # touches the page), but re-raised explicitly rather than

@@ -293,9 +293,7 @@ def parse_price(value: str | int | float | None) -> float | None:
     elif has_comma:
         # Only commas: German decimal comma, e.g. "22,95".
         raw = raw.replace(",", ".")
-    elif has_dot and (
-        raw.count(".") > 1 or len(raw.rsplit(".", 1)[-1]) not in (1, 2)
-    ):
+    elif has_dot and (raw.count(".") > 1 or len(raw.rsplit(".", 1)[-1]) not in (1, 2)):
         # Only dots, and more than one, or a single dot not followed by 1-2
         # digits: cannot be a decimal point, so it's German thousands
         # grouping ("1.234" with no decimal part) — drop it. A single dot
