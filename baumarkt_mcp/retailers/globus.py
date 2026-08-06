@@ -129,18 +129,33 @@ appearing *before* the actual price in the DOM —
 
 — confirmed on a real, live card (Alpina Innenweiß Wandfarbe, found via
 ``query=wandfarbe``): the descendant selector matched ``"-37%"`` first,
-and ``parse_price("-37%")`` returns ``37.0`` — a wrong-but-entirely-
-plausible price (not the 19.00 EUR sale price, not the 29.99 EUR RRP,
-not an error) with **no signal anything went wrong**. Fixed by switching
-``_SELECTORS["product_price"]`` to the direct-child selector
-``.product-price > span``, which is, in both the discounted and plain
-card shapes actually observed, always exactly the one `<span>` holding
-the current/sale price — confirmed against a broad sample (~180 cards
-across 7 queries plus the "Aktionen & Angebote" landing page) that this
-is the only structural variant of ``.product-price`` Globus renders.
+and at the time this was found, ``parse_price("-37%")`` returned ``37.0``
+— a wrong-but-entirely-plausible price (not the 19.00 EUR sale price, not
+the 29.99 EUR RRP, not an error) with **no signal anything went wrong**.
+
+``models.py``'s ``parse_price`` has since been hardened (prompted by this
+exact finding) to refuse percentage strings and negative values outright
+— ``parse_price("-37%")`` and ``parse_price("37%")`` now both return
+``None``, as does e.g. ``parse_price("-5,00")``. That is defence-in-depth
+at the shared parsing choke point, **not** a reason to relax the selector
+below: a selector regression would now surface as ``search()`` silently
+returning ``price=None`` for a discounted product instead of the actual
+sale price — a visible gap rather than a wrong number, but still a
+correctness failure this adapter should not rely on the parser alone to
+catch. The selector fix (below) is what actually prevents either outcome.
+
+Fixed by switching ``_SELECTORS["product_price"]`` to the direct-child
+selector ``.product-price > span``, which is, in both the discounted and
+plain card shapes actually observed, always exactly the one `<span>`
+holding the current/sale price — confirmed against a broad sample (~180
+cards across 7 queries plus the "Aktionen & Angebote" landing page) that
+this is the only structural variant of ``.product-price`` Globus renders.
 ``self_check()`` at the bottom of this module pins this down with a
 synthetic-HTML regression check against both shapes (see its docstring
-for why it lives here instead of a proper test suite).
+for why it lives here instead of a proper test suite) — it asserts the
+discounted card resolves to the 19.00 EUR sale price, so a selector
+regression fails the check loudly rather than relying on the parser's
+refusal to notice.
 """
 
 from __future__ import annotations
@@ -191,12 +206,17 @@ _SELECTORS = {
     #     <span>19,00 €</span>            <-- the actual current/sale price
     #   </div>
     # A bare `.product-price span` descendant selector matches the "-37%"
-    # span FIRST in document order — `parse_price("-37%")` happily returns
-    # 37.0, a wrong-but-plausible price with no error and no signal
-    # anything went wrong. The real current price is always the one `span`
-    # that is a *direct* child of `.product-price` (present, alone, in both
-    # the discounted and non-discounted card shapes — confirmed against
-    # live markup for both). `>` picks exactly that one and skips the
+    # span FIRST in document order. `parse_price` in models.py has since
+    # been hardened to refuse a percentage string (`parse_price("-37%")`
+    # now returns None, not the 37.0 it returned when this was found) as
+    # defence-in-depth at the shared parser — but that is a backstop, not
+    # a reason to relax this selector: a regression here would now make
+    # `search()` silently return `price=None` for a discounted product
+    # instead of its real sale price, a visible gap rather than a wrong
+    # number, but still wrong. The real current price is always the one
+    # `span` that is a *direct* child of `.product-price` (present, alone,
+    # in both the discounted and non-discounted card shapes — confirmed
+    # against live markup for both). `>` picks exactly that one and skips the
     # nested list-price-wrapper spans entirely.
     "product_price": ".product-price > span",
     "product_image_webp": "picture source[type='image/webp']",
@@ -670,8 +690,12 @@ def self_check() -> None:
     assert discounted_product.price == 19.00, (
         f"discounted card: expected the 19,00 EUR sale price, got "
         f"{discounted_product.price!r} — the price selector is matching "
-        f"the wrong <span> again (the '-37%' badge parses as 37.0, the "
-        f"29,99 EUR list price is the other wrong answer to watch for)"
+        f"the wrong <span> again. models.py's parse_price() now refuses a "
+        f"percentage string, so a regressed selector matching the '-37%' "
+        f"badge span would surface as price=None here rather than the "
+        f"37.0 it used to produce; the 29,99 EUR list price is the other "
+        f"wrong-but-plausible answer to watch for if it matches that span "
+        f"instead"
     )
 
     plain_product = _parse_listing_card(plain_card)
