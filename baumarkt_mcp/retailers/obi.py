@@ -302,34 +302,31 @@ def _extract_product_ld_json(html: str, product_id: str) -> dict[str, Any] | Non
     data lives in its `hasVariant` list — the URL still resolves to one
     specific variant (`/p/<id>` redirects to that variant's canonical
     slug), so the matching entry is the one whose own `sku` equals
-    `product_id`. Falls back to the first variant if none matches by sku
-    (a defensive fallback, not expected to trigger given the URL already
-    canonicalised to this id) rather than returning nothing for a page that
-    plainly has product data.
+    `product_id`.
+
+    `product_id` is always given by `get_product()` — there is no "just get
+    me something off this page" caller — so a block whose `sku` does not
+    match it is *never* an acceptable substitute: returning it would hand
+    the caller a different product's price/availability/sku labelled as the
+    one they asked for, silently. Returns ``None`` when nothing on the page
+    matches, rather than guessing.
     """
-    plain_products: list[dict[str, Any]] = []
-    variants: list[dict[str, Any]] = []
     for obj in _iter_ld_json_objects(html):
         if not isinstance(obj, dict):
             continue
         if obj.get("@type") == "Product":
-            plain_products.append(obj)
+            if str(obj.get("sku", "")).strip() == product_id:
+                return obj
         elif obj.get("@type") == "ProductGroup":
             has_variant = obj.get("hasVariant")
-            if isinstance(has_variant, list):
-                variants.extend(v for v in has_variant if isinstance(v, dict))
-
-    for product in plain_products:
-        if str(product.get("sku", "")).strip() == product_id:
-            return product
-    for variant in variants:
-        if str(variant.get("sku", "")).strip() == product_id:
-            return variant
-
-    if plain_products:
-        return plain_products[0]
-    if variants:
-        return variants[0]
+            if not isinstance(has_variant, list):
+                continue
+            for variant in has_variant:
+                if (
+                    isinstance(variant, dict)
+                    and str(variant.get("sku", "")).strip() == product_id
+                ):
+                    return variant
     return None
 
 
