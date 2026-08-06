@@ -376,12 +376,16 @@ class BrowserManager:
                 return
             self._in_use.discard(context)
             self._pool.append(context)
+            # Snapshot the pages BEFORE waking waiters: a waiter that pops
+            # this context can open a new page immediately, and the cleanup
+            # below must only close pages that existed at release time.
+            pages = list(context.pages)
             self._condition.notify_all()
         # Best-effort cleanup outside the lock: close any pages left open so
         # the next borrower starts from a blank tab. Cookies are kept
         # deliberately — see module docstring on reusing cleared-wall state.
         try:
-            for page in list(context.pages):
+            for page in pages:
                 await page.close()
         except BaseException:  # noqa: BLE001 - cleanup must never raise
             pass
