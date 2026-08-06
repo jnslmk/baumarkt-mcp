@@ -102,9 +102,58 @@ _THOUSANDS_SPACES = "   "
 _THOUSANDS_SPACE_TABLE = str.maketrans("", "", _THOUSANDS_SPACES)
 
 # Matches the numeric portion of a price string, keeping any thousands/decimal
-# separators (including the space family above) for parse_price to sort out:
-# "22,95" / "1.234,56 €" / "19.99" / "1 234,56" / "12 345 678,90".
-_PRICE_NUMBER_RE = re.compile(r"\d[\d.," + _THOUSANDS_SPACES + r"]*\d|\d")
+# separators for parse_price to sort out. Two shapes, tried in this order:
+#
+#  1. **Space-grouped** (DIN 5008): a 1-3 digit head, then one or more groups
+#     of EXACTLY three digits, each introduced by one of the space-family
+#     characters above, then an optional decimal part —
+#     "1 234,56" / "12 345 678,90" / "1 234.56" / "1 234".
+#  2. **Space-free**: a digit run that may carry "." and "," in any
+#     arrangement, left for the decimal-separator logic in parse_price to
+#     interpret — or to fail on, as "1,23,45" does —
+#     "22,95" / "1.234,56" / "19.99" / "1.234".
+#
+# Shape 1 must come first: shape 2's final `\d` alternative would otherwise
+# match just the "1" of "1 234,56" and report a price of 1.
+#
+# The `++` possessive quantifier and the `(?!\d)` after it are both
+# load-bearing, and cost a real bug when they were missing: a permissive
+# "digits, dots, commas and spaces in any order" pattern joined ANY two
+# space-separated digit runs into one number, so "PSB-1800 19,99 €" parsed as
+# 180019.99 and "1 23,45" as 123.45. Requiring exact three-digit groups fixes
+# the join; the possessive `++` stops the engine then salvaging a *prefix* of
+# a malformed run by giving groups back ("1 2345,67" must not quietly become
+# 1234). Together they mean a space that does not introduce a proper
+# three-digit group is not a thousands separator at all: it terminates the
+# match instead of being swallowed, and only the number in front of it is
+# read.
+_PRICE_NUMBER_RE = re.compile(
+    r"\d{1,3}(?:[" + _THOUSANDS_SPACES + r"]\d{3})++(?!\d)(?:[.,]\d+)?"
+    r"|\d[\d.,]*\d"
+    r"|\d"
+)
+
+# Characters that make a number negative when they sit directly in front of it.
+# U+2212 MINUS SIGN turns up in typeset discount badges alongside ASCII "-".
+_MINUS_SIGNS = ("-", "−")
+
+
+def _is_negative(value: str, number_start: int) -> bool:
+    """Is the number starting at `number_start` in `value` negated?
+
+    True only for a minus sign directly in front of the digits (any amount of
+    whitespace between the two is fine, including the no-break variants):
+    ``"-5,00"``, ``"- 5,00 €"``, ``"€ -5,00"``, ``"−5,00"``.
+
+    A hyphen glued to the end of an alphanumeric token is punctuation inside
+    that token, not a sign — ``"PSB-1800"`` is a model number, not minus one
+    thousand eight hundred — so it does not count.
+    """
+    prefix = value[:number_start].rstrip()
+    if not prefix.endswith(_MINUS_SIGNS):
+        return False
+    before_sign = prefix[:-1]
+    return not (before_sign and before_sign[-1].isalnum())
 
 
 def parse_price(value: str | int | float | None) -> float | None:
@@ -150,11 +199,56 @@ def parse_price(value: str | int | float | None) -> float | None:
     of the latter two instead of an ASCII space: ``"1 234,56"`` -> ``1234.56``
     regardless of which of the three that space actually is.
 
+    That grouping is **strict**: a space only separates thousands when it is
+    followed by exactly three digits, in a properly repeating group
+    (``"12 345 678,90"`` -> ``12345678.9``). A space in any other position is
+    not a separator at all — it ends the number, and only the part in front
+    of it is read. So ``"1 23,45"`` -> ``1.0`` and ``"1 2345,67"`` -> ``1.0``
+    (``"23"`` and ``"2345"`` are not thousands groups), and two unrelated
+    numbers that happen to sit either side of a space are never fused:
+    ``"PSB-1800 19,99 €"`` -> ``1800.0``, the first number in the string, not
+    the concatenation ``180019.99`` that a permissive rule produced. Reading
+    the leading number of a malformed run is the same "first number in the
+    string wins" behaviour that surrounding text already gets (``"UVP
+    1.234,56 €"``); inventing a value out of two spliced numbers is not.
+
+    **A string containing ``%`` anywhere is never a price and returns
+    ``None``** — ``"-37%"``, ``"-37 %"`` (with any of the three spaces
+    above), ``"37%"``, ``"Sparen Sie 20%"``. No legitimate price string
+    contains a percent sign, so its presence is decisive rather than
+    something to parse around. This is not hypothetical: a listing-card
+    selector matched a ``-37%`` discount badge ahead of the price element,
+    and this function turned that into a confident ``37.0``, which was then
+    reported as a product's price. A percentage reaching here means the
+    caller read the wrong element; the honest answer is "no price", which
+    :class:`Product`.price already defines a meaning for.
+
+    **A negative number in a price *string* is likewise rejected rather than
+    returned signed**: ``"-5,00"``, ``"- 5,00 €"``, ``"€ -5,00"`` and the
+    U+2212 MINUS SIGN spelling all return ``None``. (This is a string-parsing
+    rule only — the ``int``/``float`` branch above is untouched and still
+    passes a JSON-sourced ``-5`` through as ``-5.0``, because a JSON Number
+    is an unambiguous statement of the value rather than scraped text that
+    might be the wrong element.) A retail price is never below zero, so a
+    leading minus is always *something else* — a discount amount ("5 € off"),
+    a price delta in a comparison table, or a badge — and every one of those
+    is a different quantity that happens to be rendered near the price.
+    Returning ``-5.0`` would hand a price-comparison tool a number no
+    comparison can be right about (it sorts below every real price and makes
+    any total nonsense), while silently dropping the sign to ``5.0`` — what
+    this used to do — invents a price that was never on the page. ``None``
+    is the only one of the three that does not assert something false.
+    A hyphen that is part of a surrounding token is *not* a sign and is left
+    alone, so a model number such as ``"PSB-1800"`` parses exactly as before;
+    only a minus with a non-alphanumeric character (or nothing) in front of
+    it counts. Note this makes the German "even euros" form ``"19,-"``
+    unaffected — that hyphen trails the digits rather than leading them.
+
     Returns ``None`` when `value` is ``None``, a ``bool``, non-finite
-    (``NaN``/infinity), or a string that is empty or contains no
-    recognisable number at all — callers should treat all of these the same
-    as "no price shown" (see :class:`Product`.price), not as a parse error
-    to surface.
+    (``NaN``/infinity), or a string that is empty, contains a ``%``, holds a
+    negative number, or contains no recognisable number at all — callers
+    should treat all of these the same as "no price shown" (see
+    :class:`Product`.price), not as a parse error to surface.
     """
     if value is None:
         return None
@@ -167,8 +261,19 @@ def parse_price(value: str | int | float | None) -> float | None:
         return result if math.isfinite(result) else None
     if not isinstance(value, str):
         return None
+    if "%" in value:
+        # A percentage is not a price, and no price string contains a "%" —
+        # so this is decisive wherever it appears and whatever spacing sits
+        # in front of it ("-37%", "-37 %", "-37 %", "Sparen Sie 20%").
+        # Parsing it out would yield a confidently wrong price; see docstring.
+        return None
     match = _PRICE_NUMBER_RE.search(value)
     if not match:
+        return None
+    if _is_negative(value, match.start()):
+        # Negative -> not a price but a discount/delta rendered near one.
+        # Rejected rather than returned as -5.0 or (worse) sign-stripped to
+        # 5.0; see the docstring for why None is the only honest answer.
         return None
     # Space-family characters are always a thousands-grouping separator,
     # never a decimal one, so they can be dropped unconditionally before
