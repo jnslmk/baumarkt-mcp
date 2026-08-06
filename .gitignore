@@ -1,4 +1,7 @@
 .venv/
+# Recreated by the python3 -> uv run hook on every verification run; not a
+# deliberate lockfile (nothing pins dependencies), so never commit it.
+uv.lock
 __pycache__/
 *.pyc
 *.egg-info/
