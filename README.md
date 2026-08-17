@@ -31,7 +31,7 @@ image, store_pickup`.
 ### search_products
 
 ```
-search_products(query, retailer="all", store=None, max_price=None, max_results=20)
+search_products(query, retailer="all", store=None, max_price=None, max_results=20, limit=None)
 ```
 
 - `retailer` — `"all"` (default) fans out over hornbach, bauhaus, globus and
@@ -44,6 +44,12 @@ search_products(query, retailer="all", store=None, max_price=None, max_results=2
   (`price: null`) cannot be filtered and is kept.
 - `max_results` — per-retailer cap, also `str | int`, hard-capped at
   `BM_MAX_RESULTS` (default 50).
+- `limit` — deprecated alias for `max_results` (also per-retailer, not a
+  global cap across all four). Sibling MCP servers in this project
+  (aliexpress-mcp, ebay-mcp, amazon-mcp) name this knob `limit`, and a model
+  that carries that name over gets a schema rejection naming no field; both
+  search tools accept either name so a wrong guess costs nothing. Supplying
+  both `max_results` and `limit` with different values is a `ValueError`.
 
 Returns `{query, returned, results, errors}` — `results` is the flat list of
 matching products across the requested retailers, `errors` the per-retailer
@@ -65,12 +71,13 @@ id-not-found, where `error` is `null`.
 ### compare_price
 
 ```
-compare_price(query, store=None, max_results=20)
+compare_price(query, store=None, max_results=20, limit=None)
 ```
 
 Always fans out over all four retailers and sorts the merged results by
 price ascending — products with no listed price sort last. Returns
-`{query, returned, results, errors}`.
+`{query, returned, results, errors}`. `limit` is the same deprecated alias
+for `max_results` as on `search_products` (see above).
 
 ### Failure handling
 

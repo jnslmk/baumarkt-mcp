@@ -175,6 +175,65 @@ def _coerce_int(
     return result
 
 
+def _resolve_max_results(
+    max_results: str | int | None, limit: str | int | None
+) -> int:
+    """Accept either name for the per-retailer result cap, on both search tools.
+
+    Across this project's sibling MCP servers the same knob has two different
+    names — ``max_results`` here and in geizhals-mcp, ``limit`` in
+    aliexpress-mcp, ebay-mcp and amazon-mcp — and a single chat conversation
+    can put one LLM in front of all six. FastMCP emits
+    ``additionalProperties: false``, so a model that carries ``limit`` over
+    from a sibling server gets a hard schema rejection here — and the MCP
+    client's rejection ("Additional properties are not allowed ('limit' was
+    unexpected)") names no field for the model to fix, only that something is
+    wrong, so it can only guess. This exact shape burned six consecutive
+    rejected calls in one production conversation before the model happened
+    to guess right.
+
+    Both search tools now take both names, for the same reason
+    `_resolve_page_count` does in kleinanzeigen-mcp: an LLM handed two names
+    for one thing will reach for the wrong one on a sibling server, and
+    silently swallowing the unknown key would be worse than rejecting it — it
+    would hand back the default 20 while the model believed it had asked for
+    more. ``max_results`` stays canonical; its meaning here is "per
+    retailer", not a global cap, and ``limit``'s schema description repeats
+    that so an LLM cannot infer otherwise from the shorter name alone.
+    """
+    if max_results is not None and limit is not None:
+        resolved = _coerce_int(max_results, "max_results", ge=1)
+        alias = _coerce_int(limit, "limit", ge=1)
+        if resolved != alias:
+            raise ValueError(
+                "max_results and limit are two names for the same parameter "
+                f"but were given different values ({resolved} and {alias}); "
+                "pass max_results only"
+            )
+    elif limit is not None:
+        resolved = _coerce_int(limit, "limit", ge=1)
+    else:
+        resolved = _coerce_int(max_results, "max_results", ge=1)
+    return min(resolved or 20, MAX_RESULTS)
+
+
+# Shared by both search tools so the pair can never drift apart again. The
+# alias is declared in the schema rather than silently swallowed — see
+# `_resolve_max_results` for why a quietly-ignored `limit` would be worse.
+_MaxResults = Annotated[
+    str | int | None,
+    Field(description="Maximum products per retailer to return (default 20)"),
+]
+_LimitAlias = Annotated[
+    str | int | None,
+    Field(
+        description="Deprecated alias for `max_results` (maximum products "
+        "PER RETAILER, not a global cap across all four); prefer "
+        "`max_results`"
+    ),
+]
+
+
 @asynccontextmanager
 async def lifespan(_: FastMCP) -> AsyncIterator[None]:
     """One shared browser (and its concurrency gate) for the process lifetime."""
@@ -236,10 +295,8 @@ async def search_products(
             "filtered and is kept"
         ),
     ] = None,
-    max_results: Annotated[
-        str | int,
-        Field(description="Maximum products per retailer to return"),
-    ] = 20,
+    max_results: _MaxResults = None,
+    limit: _LimitAlias = None,
 ) -> dict[str, Any]:
     """Search one retailer (or all four) for products matching a keyword.
 
@@ -258,7 +315,7 @@ async def search_products(
             f"retailer must be 'all' or one of {', '.join(_RETAILERS)}; got {retailer!r}"
         )
     max_price = _coerce_int(max_price, "max_price", ge=0)
-    max_results = min(_coerce_int(max_results, "max_results", ge=1) or 20, MAX_RESULTS)
+    max_results = _resolve_max_results(max_results, limit)
 
     targets = list(_RETAILERS) if retailer == "all" else [retailer]
     results, errors = await _collect(
@@ -346,10 +403,8 @@ async def compare_price(
             "None uses each retailer's default (Braunschweig) branch"
         ),
     ] = None,
-    max_results: Annotated[
-        str | int,
-        Field(description="Maximum products per retailer to return"),
-    ] = 20,
+    max_results: _MaxResults = None,
+    limit: _LimitAlias = None,
 ) -> dict[str, Any]:
     """Compare `query` across all four retailers, side by side, cheapest first.
 
@@ -360,7 +415,7 @@ async def compare_price(
     A retailer that fails (e.g. bauhaus behind its Cloudflare challenge) is
     reported in ``errors`` while the others' results are still returned.
     """
-    max_results = min(_coerce_int(max_results, "max_results", ge=1) or 20, MAX_RESULTS)
+    max_results = _resolve_max_results(max_results, limit)
 
     results, errors = await _collect(
         [(r, _search_one(r, query, store, max_results)) for r in _RETAILERS]
