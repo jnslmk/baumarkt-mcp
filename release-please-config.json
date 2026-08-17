@@ -5,7 +5,8 @@
       "release-type": "python",
       "package-name": "baumarkt-mcp",
       "changelog-path": "CHANGELOG.md",
-      "last-release-sha": "682314ebf482e30ffb85efd446eb94988375c5ad"
+      "last-release-sha": "682314ebf482e30ffb85efd446eb94988375c5ad",
+      "include-component-in-tag": false
     }
   }
 }
