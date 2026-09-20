@@ -465,15 +465,36 @@ async def _purchasability_from_responses(
     carried this exact ``storeId`` — that is what ties a ``STORE``-kind
     result to *this* store rather than some other one, since the result
     object itself does not repeat the store id.
+
+    Responses that are not JSON or not the expected object shape are
+    recorded (warning + count) rather than silently skipped. Raises
+    :class:`BauhausParseError` when responses were captured but *none* of
+    them parses — a response that cannot be read is a failure, not a
+    missing signal. A parsed response that simply carries no matching
+    entry leaves both values `None`.
     """
     availability: str | None = None
     store_pickup: bool | None = None
+    parse_failures = 0
     for response in responses:
         try:
             body = await response.json()
         except Exception:  # noqa: BLE001 - guard against a non-JSON body
+            parse_failures += 1
+            log.warning(
+                "bauhaus: captured /api/purchasability response to %s is "
+                "not JSON — skipped",
+                response.url,
+            )
             continue
         if not isinstance(body, dict):
+            parse_failures += 1
+            log.warning(
+                "bauhaus: captured /api/purchasability response to %s has "
+                "unexpected shape (%s) — skipped",
+                response.url,
+                type(body).__name__,
+            )
             continue
         is_store_scoped = f"storeId={store_id}" in response.url
         for entry in body.get("results") or []:
@@ -485,6 +506,11 @@ async def _purchasability_from_responses(
                 availability = _bool_to_availability(bool(purchasable))
             elif kind == "STORE" and is_store_scoped and store_pickup is None:
                 store_pickup = bool(purchasable)
+    if parse_failures == len(responses) and responses:
+        raise BauhausParseError(
+            f"bauhaus: captured {len(responses)} /api/purchasability "
+            "responses but none could be parsed"
+        )
     return availability, store_pickup
 
 
