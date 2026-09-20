@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/jnslmk/baumarkt-mcp/compare/v0.1.2...v0.1.3) (2026-09-20)
+
+
+### Bug Fixes
+
+* **ci:** pass PAT to release-please so tag pushes build images ([a9acca3](https://github.com/jnslmk/baumarkt-mcp/commit/a9acca38efb804ba9699e53f1cdf0748b2d14146))
+
 ## [0.1.2](https://github.com/jnslmk/baumarkt-mcp/compare/v0.1.1...v0.1.2) (2026-09-20)
 
 
