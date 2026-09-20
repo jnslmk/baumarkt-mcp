@@ -55,8 +55,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import AsyncIterator
+import random
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import TypeVar
 
 # patchright mirrors playwright's async API surface exactly, so this import is
 # a straight swap for `from playwright.async_api import ...`.
@@ -65,8 +70,12 @@ from patchright.async_api import (
     BrowserContext,
     Page,
     Playwright,
+    Response,
+    TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
+
+T = TypeVar("T")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 log = logging.getLogger("baumarkt-mcp.browser")
@@ -95,6 +104,97 @@ PROXY_PASSWORD = os.getenv("BM_PROXY_PASSWORD") or None
 
 # How long a caller waits for a pooled context to free up before giving up.
 _POOL_WAIT_TIMEOUT_S = 120
+
+# --------------------------------------------------------------------------- #
+# pacing + backoff — applied at the navigation boundary (see fetch_page)
+# --------------------------------------------------------------------------- #
+#
+# A chat agent issues requests a handful at a time, but nothing so far spaced
+# consecutive navigations out at all: a compare_price fan-out drives four
+# searches back to back, and globus pagination fires up to _MAX_SEARCH_PAGES
+# navigations in a tight loop. This is the fastest way to look like a bot to
+# the very walls this module exists to clear, so every navigation pays a
+# jittered inter-request delay first, and transient navigation failures
+# (timeout, or a 429/503 from the edge) are retried with a capped exponential
+# backoff that honours Retry-After where the response exposes one.
+#
+# Deliberately plain constants, not env knobs — nothing here needs tuning per
+# deployment, and an untuned bot-wall scraper should err on the patient side.
+_MIN_PACING_S = 1.0
+_PACING_JITTER_S = 1.0  # uniform(0, jitter) on top of the minimum
+_BACKOFF_BASE_S = 2.0
+_BACKOFF_CAP_S = 30.0  # ceiling for a single backoff sleep
+_NAV_ATTEMPTS = 3  # initial attempt + 2 retries
+# Statuses the edge serves while throttling; anything else is either fine or
+# a hard failure the caller's parse step should surface.
+_RETRYABLE_STATUS = frozenset({429, 503})
+
+_pacing_lock = asyncio.Lock()
+_last_nav_monotonic = 0.0
+
+
+async def _pace() -> None:
+    """Space navigations at least _MIN_PACING_S + uniform(0, jitter) apart.
+
+    The lock serialises the read-add-sleep-mark sequence so two concurrent
+    navigations cannot both observe "last navigation was long ago" and skip
+    the delay — the pool allows up to MAX_CONCURRENT pages in flight, and
+    pacing is about the *site's* view of request rate, not per-context.
+    """
+    global _last_nav_monotonic
+    async with _pacing_lock:
+        now = time.monotonic()
+        earliest = _last_nav_monotonic + _MIN_PACING_S + random.uniform(
+            0.0, _PACING_JITTER_S
+        )
+        delay = earliest - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+        _last_nav_monotonic = time.monotonic()
+
+
+def _retry_after_seconds(value: str) -> float | None:
+    """Seconds to wait for one `Retry-After` header value, or None.
+
+    Handles both RFC 7231 forms: delta-seconds (``"120"``) and HTTP-date
+    (``"Wed, 21 Oct 2026 07:28:00 GMT"``, resolved against the wall clock —
+    HTTP dates are wall-clock by definition). A past date means "retry now"
+    and yields ``0.0``. Unparseable values return None so the caller falls
+    back to its own backoff.
+    """
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if retry_at.tzinfo is None:
+        # Naive timestamp — no basis to compare against a clock; ignore.
+        return None
+    now = datetime.now(timezone.utc)
+    return max(0.0, (retry_at - now).total_seconds())
+
+
+def _retry_delay_s(attempt: int, response: Response | None) -> float:
+    """How long to wait before navigation retry `attempt` (0-based).
+
+    Honours the `Retry-After` header when the response carries one — both
+    its delta-seconds and its HTTP-date form (capped at `_BACKOFF_CAP_S`) —
+    otherwise capped exponential backoff with uniform jitter.
+    """
+    retry_after = response.headers.get("Retry-After") if response is not None else None
+    if retry_after is not None:
+        delay = _retry_after_seconds(retry_after)
+        if delay is not None:
+            return min(_BACKOFF_CAP_S, delay)
+    return min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * 2**attempt) + random.uniform(
+        0.0, _BACKOFF_BASE_S
+    )
 
 
 def _proxy_config() -> dict[str, str] | None:
@@ -180,7 +280,32 @@ async def _visible_text(page: Page) -> str:
         return ""
 
 
-async def wait_for_challenge_clear(page: Page, timeout_ms: int | None = None) -> None:
+async def _current_wall(page: Page) -> str | None:
+    """Which known bot wall (if any) `page` is showing *right now*.
+
+    Single poll, no waiting: ``"hornbach-captcha"`` is the unrecoverable
+    image-CAPTCHA variant, ``"challenge"`` a clearable interstitial (either
+    vendor's), ``None`` real content. Both DOM reads are best-effort (see
+    `_visible_text`) — a page mid-render can read as `None`, which callers
+    treat as "not a wall *yet*".
+    """
+    title = (await page.title() or "").lower()
+    text = (await _visible_text(page)).lower()
+
+    # The image CAPTCHA is checked first so it never gets misreported as a
+    # clearable challenge.
+    if _HORNBACH_CAPTCHA_MARKER in text:
+        return "hornbach-captcha"
+    if (
+        _HORNBACH_TITLE_MARKER in title
+        or any(m in title for m in _BAUHAUS_TITLE_MARKERS)
+        or _BAUHAUS_BODY_MARKER in text
+    ):
+        return "challenge"
+    return None
+
+
+async def wait_for_challenge_clear(page: Page, timeout_ms: int | None = None) -> bool:
     """Block until `page` is real content, not a bot-wall interstitial.
 
     Shared by every browser-driven retailer adapter (hornbach, bauhaus,
@@ -202,37 +327,148 @@ async def wait_for_challenge_clear(page: Page, timeout_ms: int | None = None) ->
 
     Raises :class:`CaptchaRequired` on the unrecoverable hornbach CAPTCHA, or
     :class:`ChallengeTimeout` if a wall is still showing when `timeout_ms`
-    (default :data:`CHALLENGE_TIMEOUT_MS`) elapses. Returns ``None`` once the
-    page shows neither wall.
+    (default :data:`CHALLENGE_TIMEOUT_MS`) elapses. Returns ``True`` when a
+    wall was present and cleared, ``False`` when the page never showed one —
+    :func:`fetch_page` uses that to know when a non-2xx goto response is a
+    stale interstitial rather than the page's real status.
     """
     deadline_ms = CHALLENGE_TIMEOUT_MS if timeout_ms is None else timeout_ms
     step_ms = 250
     waited_ms = 0
+    saw_wall = False
     while True:
-        title = (await page.title() or "").lower()
-        text = (await _visible_text(page)).lower()
-
-        if _HORNBACH_CAPTCHA_MARKER in text:
+        wall = await _current_wall(page)
+        if wall is None:
+            return saw_wall
+        saw_wall = True
+        if wall == "hornbach-captcha":
             raise CaptchaRequired(
                 "Hornbach served an image CAPTCHA instead of a challenge — "
                 "this cannot be cleared automatically."
             )
-
-        on_wall = (
-            _HORNBACH_TITLE_MARKER in title
-            or any(m in title for m in _BAUHAUS_TITLE_MARKERS)
-            or _BAUHAUS_BODY_MARKER in text
-        )
-        if not on_wall:
-            return
-
         if waited_ms >= deadline_ms:
             raise ChallengeTimeout(
                 f"Bot-wall challenge did not clear within {deadline_ms}ms "
-                f"(title={title!r})"
+                f"(title={(await page.title() or '').lower()!r})"
             )
         await page.wait_for_timeout(step_ms)
         waited_ms += step_ms
+
+
+# --------------------------------------------------------------------------- #
+# shared page fetch — navigation + challenge + cleanup in one place
+# --------------------------------------------------------------------------- #
+
+# Default per-navigation timeout for fetch_page. Every adapter previously
+# rolled its own (hornbach/globus: 30s, bauhaus: none at all — a stalled
+# navigation hung on playwright's own much larger default); one shared
+# default keeps them honest.
+DEFAULT_NAV_TIMEOUT_MS = 30_000
+
+
+async def fetch_page(
+    ctx: BrowserContext,
+    url: str,
+    parse: Callable[[Page, Response | None], Awaitable[T]],
+    *,
+    prepare: Callable[[Page], Awaitable[None]] | None = None,
+    clear_challenge: Callable[[Page], Awaitable[None]] = wait_for_challenge_clear,
+    timeout_ms: int = DEFAULT_NAV_TIMEOUT_MS,
+) -> T:
+    """Navigate one pooled-context page to `url`, clear the bot wall, parse.
+
+    Single owner of the goto/challenge/cleanup sequence every browser-backed
+    adapter used to duplicate (bauhaus even omitted the explicit navigation
+    timeout): opens a page on `ctx`, runs `prepare` (e.g. registering
+    response-capture handlers, which must happen *before* navigation),
+    navigates with an explicit timeout, clears the wall, hands the page plus
+    the goto response to `parse`, and closes the page in a finally.
+
+    Also owns pacing and transient-failure retry: every navigation pays the
+    shared jittered pacing delay first. A navigation timeout is retried up
+    to `_NAV_ATTEMPTS` times with capped exponential backoff (honouring
+    Retry-After in both its delta-seconds and HTTP-date forms). A 429/503 is
+    retried the same way *only when the page is not a bot wall* — walls
+    serving those statuses are handed to `clear_challenge` and then
+    re-navigated, never retried into. After clearing, a stale non-2xx
+    interstitial response is refreshed with one re-navigation so `parse`
+    sees the page's real status. Challenge failures proper (an interstitial
+    that never clears) are deliberately NOT retried — `clear_challenge`
+    decides what a wall means (bauhaus's interactive variant must
+    propagate, not be retried into).
+
+    `parse` receives the goto `Response` so a caller can classify statuses
+    itself (e.g. hornbach's 404-on-unknown-sku) instead of trusting that a
+    resolved navigation means a healthy page.
+    """
+    page = await ctx.new_page()
+    try:
+        if prepare is not None:
+            await prepare(page)
+        response: Response | None = None
+        for attempt in range(_NAV_ATTEMPTS):
+            await _pace()
+            try:
+                response = await page.goto(
+                    url, wait_until="domcontentloaded", timeout=timeout_ms
+                )
+            except PlaywrightTimeoutError:
+                if attempt == _NAV_ATTEMPTS - 1:
+                    raise
+                delay = _retry_delay_s(attempt, None)
+                log.warning(
+                    "navigation to %s timed out after %dms (attempt %d/%d), "
+                    "retrying in %.1fs",
+                    url,
+                    timeout_ms,
+                    attempt + 1,
+                    _NAV_ATTEMPTS,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            status = response.status if response is not None else 0
+            if status in _RETRYABLE_STATUS and attempt < _NAV_ATTEMPTS - 1:
+                # A 429/503 is only "throttling" if the page is not a bot
+                # wall — several walls serve their interstitial with exactly
+                # these statuses, and those must never be blind-retried.
+                wall = await _current_wall(page)
+                if wall == "hornbach-captcha":
+                    break  # unrecoverable — clear_challenge raises it below
+                if wall is not None:
+                    # The throttling status IS the interstitial: let the
+                    # challenge machinery resolve it, then re-navigate for a
+                    # real response instead of retrying into the wall.
+                    await clear_challenge(page)
+                    continue
+                delay = _retry_delay_s(attempt, response)
+                log.warning(
+                    "navigation to %s got HTTP %d (attempt %d/%d), "
+                    "retrying in %.1fs",
+                    url,
+                    status,
+                    attempt + 1,
+                    _NAV_ATTEMPTS,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            break
+        saw_wall = await clear_challenge(page)
+        if saw_wall and response is not None and response.status >= 400:
+            # The wall's interstitial arrived with a non-2xx status (bauhaus's
+            # Turnstile serves 403) and has since cleared into the real
+            # document, so the stale response no longer describes the page —
+            # re-navigate once now that the wall is down, so `parse` sees the
+            # page's true status instead of the challenge's.
+            await _pace()
+            response = await page.goto(
+                url, wait_until="domcontentloaded", timeout=timeout_ms
+            )
+            await clear_challenge(page)
+        return await parse(page, response)
+    finally:
+        await page.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -324,7 +560,27 @@ class BrowserManager:
             # default 1366x900) and is a realistic desktop size — locale and
             # viewport both feed bot-detection heuristics on these sites.
             viewport={"width": 1366, "height": 900},
-            extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.6"},
+            extra_http_headers={
+                "Accept-Language": "de-DE,de;q=0.9,en;q=0.6",
+                # Set explicitly rather than relying on the engine default so
+                # the header trio (UA + Accept + Accept-Language) is one
+                # documented, deterministic unit. The version is taken from
+                # the actual engine, so the UA can never drift ahead of (or
+                # behind) the browser's real behaviour — a hard-coded version
+                # would go stale with the next patchright bump and is a
+                # classic fingerprint mismatch.
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    f"(KHTML, like Gecko) Chrome/{self._browser.version} "
+                    "Safari/537.36"
+                ),
+                # What desktop Chrome sends for a navigation request.
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,image/apng,*/*;q=0.8,"
+                    "application/signed-exchange;v=b3;q=0.7"
+                ),
+            },
         )
 
     async def get_context(self) -> BrowserContext:

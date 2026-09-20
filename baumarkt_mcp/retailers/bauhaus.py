@@ -116,10 +116,12 @@ import urllib.parse
 from typing import Any
 
 from bs4 import BeautifulSoup
+from patchright.async_api import Response
 
 from baumarkt_mcp.browser import (
     BrowserManager,
     ChallengeTimeout,
+    fetch_page,
     wait_for_challenge_clear,
 )
 from baumarkt_mcp.models import Product, normalize_availability, parse_price
@@ -129,6 +131,21 @@ log = logging.getLogger("baumarkt-mcp.bauhaus")
 RETAILER = "bauhaus"
 BASE_URL = "https://www.bauhaus.info"
 SEARCH_PATH = "/suche/produkte"
+
+
+class BauhausParseError(RuntimeError):
+    """bauhaus.info served a page whose expected data is missing.
+
+    Raised when a search page neither captured its ``/api/products``
+    responses nor carries an ``ItemList`` JSON-LD block nor shows its
+    "Kein Ergebnis" empty state, when captured responses exist but none can
+    be parsed, or when a resolved detail page lacks its ``Product`` JSON-LD
+    or its embedded price payload. Deliberately distinct from a genuine
+    zero-result search (empty list) or an unknown product id (``None``) — a
+    layout change or a degraded page must surface as an error, never
+    silently read as "nothing found".
+    """
+
 
 # storeId 607 = Braunschweig — the only branch this project has measured.
 # Carried both as the `selectedStore` cookie (read by the storefront to pick
@@ -169,6 +186,12 @@ _EMBEDDED_PRICE_RE = re.compile(
     re.DOTALL,
 )
 
+# Measured live 2026-09-20: a zero-hit search page renders "Kein Ergebnis
+# für "<query>"" in the body and carries no ItemList JSON-LD and issues no
+# /api/products request — this phrase is the positive "genuinely no results"
+# signal, checked before an empty fallback result is returned.
+_EMPTY_RESULTS_MARKER = "Kein Ergebnis"
+
 
 # --------------------------------------------------------------------------- #
 # bot-wall handling
@@ -193,9 +216,14 @@ async def _clear_challenge(page: Any) -> None:
     Either way this is the same exception type, so an existing
     ``except ChallengeTimeout`` in a caller keeps working — deliberately not
     swallowed into an empty result here, see module docstring point 4.
+
+    Returns :func:`baumarkt_mcp.browser.wait_for_challenge_clear`'s flag:
+    ``True`` when a wall was present and cleared, ``False`` when the page
+    never showed one (fetch_page uses this to refresh stale interstitial
+    responses).
     """
     try:
-        await wait_for_challenge_clear(page)
+        return await wait_for_challenge_clear(page)
     except ChallengeTimeout as exc:
         if _INTERACTIVE_CHALLENGE_TITLE_MARKER in str(exc).lower():
             raise ChallengeTimeout(
@@ -492,8 +520,16 @@ async def search(
     variant (module docstring point 1), this always raises
     `ChallengeTimeout` with an explicit "interactive challenge, not
     attempted" message rather than falling back to an empty result — that is
-    the intended behaviour for that case, not a bug. Never raises on a
-    genuine zero-result search; returns `[]` for that.
+    the intended behaviour for that case, not a bug.
+
+    Returns `[]` only for a positively-recognized zero-result search — the
+    page renders its "Kein Ergebnis" empty state (or the JSON-LD fallback
+    finds an ItemList with no usable items). Any other failure to produce
+    results — no `/api/products` captured, no ItemList, no empty-state
+    marker, or captured responses that are all unparseable — raises
+    :class:`BauhausParseError`: a page that resolved but produced neither
+    data nor a recognized empty state is a structural failure, not "no
+    results".
     """
     store_id = str(store) if store is not None else DEFAULT_STORE_ID
     # `text` is a query-string value, not a path segment — quote_plus (not
@@ -503,6 +539,73 @@ async def search(
     search_url = f"{BASE_URL}{SEARCH_PATH}?text={urllib.parse.quote_plus(query)}"
 
     captured: list[Any] = []
+
+    async def prepare(page: Any) -> None:
+        # Response capture must be registered *before* navigation — see
+        # module docstring point 2.
+        page.on(
+            "response",
+            lambda r: captured.append(r) if _API_PRODUCTS_MARKER in r.url else None,
+        )
+
+    async def parse(page: Any, response: Response | None) -> list[Product]:
+        if response is not None and not 200 <= response.status <= 299:
+            # fetch_page refreshes stale interstitial responses, so this is
+            # the page's real status — anything outside 2xx (error pages,
+            # unexpected redirects) must never reach the empty-state
+            # classification below and read as "no results".
+            raise BauhausParseError(
+                f"bauhaus search page for {query!r} returned HTTP {response.status}"
+            )
+        await _accumulate(
+            captured, window_s=_ACCUMULATE_WINDOW_S, quiet_s=_ACCUMULATE_QUIET_S
+        )
+
+        if captured:
+            return await _products_from_captured(captured, max_results)
+
+        log.info(
+            "bauhaus: no /api/products response captured for %r within %.1fs, "
+            "falling back to JSON-LD",
+            query,
+            _ACCUMULATE_WINDOW_S,
+        )
+        html = await page.content()
+        items = _search_items_from_ld_json(html)
+        results = []
+        skipped = 0
+        for item in items[:max_results]:
+            product = _product_from_ld_json_item(item)
+            if product is None:
+                skipped += 1
+                continue
+            results.append(product)
+        if skipped:
+            log.warning(
+                "bauhaus: search for %r: skipped %d unparseable JSON-LD items",
+                query,
+                skipped,
+            )
+        if items:
+            if not results:
+                # The page advertised ItemList items and not one parsed —
+                # a markup change, not "no results".
+                raise BauhausParseError(
+                    f"bauhaus search page for {query!r} listed "
+                    f"{len(items)} JSON-LD items but none parsed"
+                )
+            return results
+        # No captured data and no ItemList: only a positively rendered
+        # empty state may read as "no results".
+        text = await page.inner_text("body")
+        if _EMPTY_RESULTS_MARKER in text:
+            log.info("bauhaus: confirmed zero hits for %r", query)
+            return []
+        raise BauhausParseError(
+            f"bauhaus search page for {query!r} resolved but carries neither "
+            f"/api/products data, an ItemList JSON-LD block, nor its "
+            f"{_EMPTY_RESULTS_MARKER!r} empty state"
+        )
 
     async with manager.context() as ctx:
         await ctx.add_cookies(
@@ -515,65 +618,78 @@ async def search(
                 }
             ]
         )
-        page = await ctx.new_page()
-        try:
-            page.on(
-                "response",
-                lambda r: captured.append(r) if _API_PRODUCTS_MARKER in r.url else None,
-            )
-            await page.goto(search_url, wait_until="domcontentloaded")
-            await _clear_challenge(page)
-            await _accumulate(
-                captured, window_s=_ACCUMULATE_WINDOW_S, quiet_s=_ACCUMULATE_QUIET_S
-            )
-
-            if captured:
-                return await _products_from_captured(captured, max_results)
-
-            log.info(
-                "bauhaus: no /api/products response captured for %r within %.1fs, "
-                "falling back to JSON-LD",
-                query,
-                _ACCUMULATE_WINDOW_S,
-            )
-            html = await page.content()
-            items = _search_items_from_ld_json(html)
-            results = []
-            for item in items[:max_results]:
-                product = _product_from_ld_json_item(item)
-                if product is not None:
-                    results.append(product)
-            return results
-        finally:
-            await page.close()
+        return await fetch_page(
+            ctx, search_url, parse, prepare=prepare, clear_challenge=_clear_challenge
+        )
 
 
 async def _products_from_captured(
     captured: list[Any], max_results: int
 ) -> list[Product]:
-    """Merge captured `/api/products` responses into `Product`s, in search order."""
+    """Merge captured `/api/products` responses into `Product`s, in search order.
+
+    Responses that are not JSON, not the expected object shape, or lack a
+    ``products`` mapping are recorded (warning + count) rather than silently
+    skipped. Raises :class:`BauhausParseError` when *no* captured response
+    is a well-formed payload — the page advertised its product data and none
+    of it is readable, which is a failure, not an empty result. A payload
+    that explicitly carries an empty ``products`` mapping is a
+    positively-empty result and yields `[]`.
+    """
     products: dict[str, Any] = {}
     prices: dict[str, Any] = {}
     purchasabilities: dict[str, Any] = {}
     order: list[str] = []
+    parse_failures = 0
 
     for response in captured:
         try:
             body = await response.json()
         except Exception:  # noqa: BLE001 - guard against a non-JSON body
+            parse_failures += 1
+            log.warning(
+                "bauhaus: captured /api/products response to %s is not "
+                "JSON — skipped",
+                response.url,
+            )
             continue
         if not isinstance(body, dict):
+            parse_failures += 1
+            log.warning(
+                "bauhaus: captured /api/products response to %s has "
+                "unexpected shape (%s) — skipped",
+                response.url,
+                type(body).__name__,
+            )
+            continue
+        payload = body.get("products")
+        if not isinstance(payload, dict):
+            # A dict without a products mapping is not a "successful empty
+            # search" — the real empty payload carries `products: {}` — so
+            # anything else is an unparseable shape, not an empty one.
+            parse_failures += 1
+            log.warning(
+                "bauhaus: captured /api/products response to %s carries no "
+                "products mapping (%s) — skipped",
+                response.url,
+                type(payload).__name__,
+            )
             continue
         if not order:
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(response.url).query)
             ids_param = qs.get("productIds", [""])[0]
             order = [pid for pid in ids_param.split(",") if pid]
-        if isinstance(body.get("products"), dict):
-            products.update(body["products"])
+        products.update(payload)
         if isinstance(body.get("prices"), dict):
             prices.update(body["prices"])
         if isinstance(body.get("purchasabilities"), dict):
             purchasabilities.update(body["purchasabilities"])
+
+    if parse_failures == len(captured):
+        raise BauhausParseError(
+            f"bauhaus: captured {len(captured)} /api/products responses but "
+            "none could be parsed"
+        )
 
     ids = order or list(products.keys())
     results: list[Product] = []
@@ -615,8 +731,14 @@ async def get_product(
       guaranteed to stay that way), that structured data is preferred over
       the JSON-LD + regex combination above.
 
-    Returns `None` if the id does not resolve to a real product page (no
-    `Product` JSON-LD block found at all) rather than raising.
+    Returns `None` only when the id *positively* does not resolve to a
+    product: the HTTP 404 bauhaus answers some unknown ids with, or —
+    measured live 2026-09-20 — the redirect that takes an unknown
+    ``/p/<id>`` off the PDP route onto a campaign landing page
+    (``/ad/produkte``, HTTP 200). A page that stays on the PDP route but
+    lacks its `Product` JSON-LD block or its embedded price payload raises
+    :class:`BauhausParseError`: a resolved PDP always carries them, so
+    their absence is a structural failure, never "no such product".
 
     Raises :class:`baumarkt_mcp.browser.CaptchaRequired` or
     :class:`baumarkt_mcp.browser.ChallengeTimeout` if bauhaus's bot wall
@@ -632,6 +754,124 @@ async def get_product(
     api_products_responses: list[Any] = []
     purchasability_responses: list[Any] = []
 
+    async def prepare(page: Any) -> None:
+        # Response capture must be registered *before* navigation — see
+        # module docstring points 2 and 3.
+        def _on_response(r: Any) -> None:
+            if _API_PRODUCTS_MARKER in r.url:
+                api_products_responses.append(r)
+            elif _API_PURCHASABILITY_MARKER in r.url:
+                purchasability_responses.append(r)
+
+        page.on("response", _on_response)
+
+    async def parse(page: Any, response: Response | None) -> Product | None:
+        if response is not None and response.status == 404:
+            return None
+        if response is not None and not 200 <= response.status <= 299:
+            # fetch_page refreshes stale interstitial responses, so this is
+            # the page's real status — anything outside 2xx (error pages,
+            # unexpected redirects) is a failure, not "no such product".
+            raise BauhausParseError(
+                f"bauhaus detail page for id={product_id} returned HTTP "
+                f"{response.status}"
+            )
+        if "/p/" not in page.url:
+            # Unknown ids redirect off the PDP route onto a campaign landing
+            # page (measured live 2026-09-20: /p/<garbage> -> /ad/produkte,
+            # HTTP 200) — a positive "no such product", not a parse failure.
+            log.info(
+                "bauhaus: id=%s did not resolve to a PDP (landed on %s)",
+                product_id,
+                page.url,
+            )
+            return None
+
+        await _accumulate(
+            purchasability_responses,
+            window_s=_PURCHASABILITY_WINDOW_S,
+            quiet_s=_PURCHASABILITY_QUIET_S,
+        )
+
+        availability, store_pickup = await _purchasability_from_responses(
+            purchasability_responses, product_id, store_id
+        )
+
+        api_product = api_price_entry = api_purch = None
+        for api_response in api_products_responses:
+            try:
+                body = await api_response.json()
+            except Exception:  # noqa: BLE001 - guard against a non-JSON body
+                log.warning(
+                    "bauhaus: captured /api/products response to %s is not "
+                    "JSON — skipped",
+                    api_response.url,
+                )
+                continue
+            if not isinstance(body, dict):
+                log.warning(
+                    "bauhaus: captured /api/products response to %s has "
+                    "unexpected shape (%s) — skipped",
+                    api_response.url,
+                    type(body).__name__,
+                )
+                continue
+            products = body.get("products") or {}
+            if product_id in products:
+                api_product = products[product_id]
+                api_price_entry = (body.get("prices") or {}).get(product_id)
+                api_purch = (body.get("purchasabilities") or {}).get(product_id)
+                break
+
+        if api_product is not None:
+            log.info(
+                "bauhaus: get_product id=%s from captured /api/products response",
+                product_id,
+            )
+            result = _product_from_api(
+                product_id, api_product, api_price_entry, api_purch
+            )
+            # Prefer the dedicated purchasability signal (real per-store
+            # data) over /api/products's unconfirmed-store-specific one.
+            if availability is not None:
+                result = _replace(result, availability=availability)
+            if store_pickup is not None:
+                result = _replace(result, store_pickup=store_pickup)
+
+        html = await page.content()
+        if api_product is None:
+            ld_block = _product_ld_json_block(html)
+            if ld_block is None:
+                raise BauhausParseError(
+                    f"bauhaus PDP for id={product_id} ({page.url}) resolved "
+                    "but carries no Product JSON-LD block"
+                )
+            log.info(
+                "bauhaus: get_product id=%s from Product JSON-LD + embedded payload",
+                product_id,
+            )
+            result = _product_from_ld_json_item(ld_block, store_pickup=store_pickup)
+            if result is None:
+                raise BauhausParseError(
+                    f"bauhaus Product JSON-LD for id={product_id} has no "
+                    "usable sku"
+                )
+        # else: result was already built from the captured /api/products
+        # response above; both paths converge on the price requirement below.
+
+        if result.price is None:
+            price, currency = _embedded_price_for(html, product_id)
+            if price is not None:
+                result = _replace(result, price=price, currency=currency)
+        if result.price is None:
+            raise BauhausParseError(
+                f"bauhaus PDP for id={product_id} resolved but carries no "
+                "price in either /api/products or its embedded payload"
+            )
+        if availability is not None:
+            result = _replace(result, availability=availability)
+        return result
+
     async with manager.context() as ctx:
         await ctx.add_cookies(
             [
@@ -643,88 +883,9 @@ async def get_product(
                 }
             ]
         )
-        page = await ctx.new_page()
-        try:
-
-            def _on_response(r: Any) -> None:
-                if _API_PRODUCTS_MARKER in r.url:
-                    api_products_responses.append(r)
-                elif _API_PURCHASABILITY_MARKER in r.url:
-                    purchasability_responses.append(r)
-
-            page.on("response", _on_response)
-            await page.goto(product_url, wait_until="domcontentloaded")
-            await _clear_challenge(page)
-            await _accumulate(
-                purchasability_responses,
-                window_s=_PURCHASABILITY_WINDOW_S,
-                quiet_s=_PURCHASABILITY_QUIET_S,
-            )
-
-            availability, store_pickup = await _purchasability_from_responses(
-                purchasability_responses, product_id, store_id
-            )
-
-            api_product = api_price_entry = api_purch = None
-            for response in api_products_responses:
-                try:
-                    body = await response.json()
-                except Exception:  # noqa: BLE001 - guard against a non-JSON body
-                    continue
-                if not isinstance(body, dict):
-                    continue
-                products = body.get("products") or {}
-                if product_id in products:
-                    api_product = products[product_id]
-                    api_price_entry = (body.get("prices") or {}).get(product_id)
-                    api_purch = (body.get("purchasabilities") or {}).get(product_id)
-                    break
-
-            if api_product is not None:
-                log.info(
-                    "bauhaus: get_product id=%s from captured /api/products response",
-                    product_id,
-                )
-                result = _product_from_api(
-                    product_id, api_product, api_price_entry, api_purch
-                )
-                # Prefer the dedicated purchasability signal (real per-store
-                # data) over /api/products's unconfirmed-store-specific one.
-                if availability is not None:
-                    result = _replace(result, availability=availability)
-                if store_pickup is not None:
-                    result = _replace(result, store_pickup=store_pickup)
-                return result
-
-            html = await page.content()
-            ld_block = _product_ld_json_block(html)
-            if ld_block is None:
-                log.info(
-                    "bauhaus: no Product JSON-LD found for id=%s — no such product",
-                    product_id,
-                )
-                return None
-
-            log.info(
-                "bauhaus: get_product id=%s from Product JSON-LD + embedded payload",
-                product_id,
-            )
-            result = _product_from_ld_json_item(ld_block, store_pickup=store_pickup)
-            if result is None:
-                log.info(
-                    "bauhaus: Product JSON-LD for id=%s has no sku — no usable product",
-                    product_id,
-                )
-                return None
-            if result.price is None:
-                price, currency = _embedded_price_for(html, product_id)
-                if price is not None:
-                    result = _replace(result, price=price, currency=currency)
-            if availability is not None:
-                result = _replace(result, availability=availability)
-            return result
-        finally:
-            await page.close()
+        return await fetch_page(
+            ctx, product_url, parse, prepare=prepare, clear_challenge=_clear_challenge
+        )
 
 
 def _replace(product: Product, **changes: Any) -> Product:

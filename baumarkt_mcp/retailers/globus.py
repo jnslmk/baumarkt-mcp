@@ -163,12 +163,15 @@ from __future__ import annotations
 import json
 import logging
 import re
-from urllib.parse import quote_plus, urljoin
+from collections.abc import Awaitable, Callable
+from typing import Any
+from urllib.parse import quote_plus, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 from bs4.element import Tag
+from patchright.async_api import Response
 
-from baumarkt_mcp.browser import BrowserManager, wait_for_challenge_clear
+from baumarkt_mcp.browser import BrowserManager, fetch_page
 from baumarkt_mcp.models import Product, normalize_availability, parse_price
 
 log = logging.getLogger("baumarkt-mcp.globus")
@@ -176,10 +179,23 @@ log = logging.getLogger("baumarkt-mcp.globus")
 RETAILER = "globus"
 BASE_URL = "https://www.globus-baumarkt.de"
 
+
+class GlobusParseError(RuntimeError):
+    """globus-baumarkt.de served a page whose expected structure is missing.
+
+    Raised when a search page never rendered its results container or
+    empty-state block, a page advertised result cards but none could be
+    parsed, or a resolved PDP carries no usable ``Product`` JSON-LD.
+    Deliberately distinct from a genuine zero-result search (empty list) or
+    an unknown article number (``None``) — a layout change must surface as
+    an error, never silently read as "nothing found".
+    """
+
+
 # Generous but bounded — a cold FactFinder render plus Shopware storefront
 # render is slower than a static page, but this must not hang a caller
-# forever if the site stalls.
-_NAV_TIMEOUT_MS = 30_000
+# forever if the site stalls. (The per-navigation timeout itself is
+# fetch_page's shared default — browser.py.)
 _RESULTS_TIMEOUT_MS = 15_000
 
 # Hard cap on how many search-result pages a single search() call will
@@ -194,6 +210,11 @@ _MAX_SEARCH_PAGES = 5
 _SELECTORS = {
     # Search listing (FactFinder-rendered Shopware storefront markup).
     "results_container": "div.cms-element-product-listing",
+    # Server-rendered zero-hit page: measured live 2026-09-20, a search with
+    # no matches renders this block INSTEAD of the listing container (the
+    # container element does not exist at all on that page), so its presence
+    # is the positive "genuinely no results" signal.
+    "no_results_marker": ".no-results-cms-page",
     "product_card": "div.card.product-box.box-standard",
     "product_name": ".product-name",
     # Direct-child combinator, not a bare descendant selector — deliberate.
@@ -245,6 +266,8 @@ _LISTING_BRAND_RE = re.compile(
     r"createDataLayerForListings\(\s*'[^']*'\s*,\s*'([^']*)'"
 )
 
+_PDP_PATH_RE = re.compile(r"^/p/[^/?#\s]+/?$")
+
 
 def _build_search_url(query: str, page: int = 1) -> str:
     url = f"{BASE_URL}/search/result?query={quote_plus(query)}"
@@ -254,12 +277,74 @@ def _build_search_url(query: str, page: int = 1) -> str:
 
 
 def _looks_like_pdp_url(url: str) -> bool:
-    """True once navigation has landed on a product detail page.
+    """True for a resolved URL on Globus's actual product-detail route."""
+    if not isinstance(url, str) or url != url.strip() or any(
+        char.isspace() for char in url
+    ):
+        return False
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or hostname != "www.globus-baumarkt.de"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.fragment
+    ):
+        return False
+    return _PDP_PATH_RE.fullmatch(parsed.path) is not None
 
-    Distinguishes the single-hit-redirect case (search -> `/p/<slug>/`)
-    from still being on the search results listing itself.
+
+async def _rendered_search_soup(
+    page: Any, *, query: str, page_num: int
+) -> tuple[Any, bool]:
+    """Wait until the search page reaches one of its two ready states, then
+    return its parsed DOM plus an emptiness verdict.
+
+    The page is ready when either the results container has rendered (real
+    results, populated client-side by FactFinder — waiting for *visible*
+    means waiting for populated) or the server-rendered
+    ``.no-results-cms-page`` empty-state block is present. Measured live
+    2026-09-20: a zero-hit search renders the marker INSTEAD of the
+    container — the container element does not exist at all on that page —
+    so waiting on the container alone made every genuine zero-hit search
+    look like a render failure.
+
+    The verdict is made in the live DOM, not in the parsed HTML: only a
+    *visibly rendered* marker counts as "no results" — a hidden marker
+    template sitting in the markup next to a rendered listing (or vice
+    versa) must not flip the result.
+
+    Raises :class:`GlobusParseError` when neither appears within
+    `_RESULTS_TIMEOUT_MS` — that is an unrecognized page, not an empty one.
     """
-    return "/search/result" not in url and "/p/" in url
+    union = f'{_SELECTORS["results_container"]}, {_SELECTORS["no_results_marker"]}'
+    try:
+        await page.wait_for_selector(union, timeout=_RESULTS_TIMEOUT_MS)
+    except Exception as exc:
+        # The marker can in principle sit in the DOM without being made
+        # visible (its own markup carries no hiding class, but an ancestor
+        # section might stay hidden). A marker that never actually renders
+        # is not positive evidence of an empty result list — only a
+        # *visibly rendered* empty state counts; anything else is a render
+        # failure.
+        marker = await page.query_selector(_SELECTORS["no_results_marker"])
+        if marker is None or not await marker.is_visible():
+            raise GlobusParseError(
+                f"globus search page {page_num} for {query!r} never rendered "
+                "its results container or empty-state block"
+            ) from exc
+        return BeautifulSoup(await page.content(), "lxml"), True
+    # The union wait proves one of the two became visible; decide which in
+    # the live DOM rather than in the parsed HTML, where visibility is lost.
+    marker = await page.query_selector(_SELECTORS["no_results_marker"])
+    empty = marker is not None and await marker.is_visible()
+    return BeautifulSoup(await page.content(), "lxml"), empty
 
 
 def _parse_listing_card(card: Tag) -> Product | None:
@@ -399,7 +484,16 @@ def _extract_jsonld_product(raw_blocks: list[str], product_id: str) -> dict | No
     return None
 
 
-async def _parse_pdp(page, fallback_id: str) -> Product | None:
+async def _parse_pdp(page: Any, fallback_id: str) -> Product:
+    """Parse the resolved PDP's Product JSON-LD (plus store-pickup widget).
+
+    Raises :class:`GlobusParseError` when the resolved detail page carries no
+    parseable ``Product``/``ProductGroup`` JSON-LD, or JSON-LD without the
+    fields a `Product` cannot do without — a resolved PDP always carries
+    them, so their absence is a structural failure, never "not found"
+    (not-found is decided by the caller from the rendered search page before
+    this is reached).
+    """
     script_texts: list[str] = []
     for el in await page.query_selector_all(_SELECTORS["jsonld"]):
         try:
@@ -409,13 +503,17 @@ async def _parse_pdp(page, fallback_id: str) -> Product | None:
 
     ld = _extract_jsonld_product(script_texts, fallback_id)
     if ld is None:
-        log.warning("globus PDP %s: no schema.org Product JSON-LD found", page.url)
-        return None
+        raise GlobusParseError(
+            f"globus PDP {page.url}: no parseable schema.org Product JSON-LD found"
+        )
 
     name = ld.get("name")
     product_id = ld.get("sku") or fallback_id
     if not name or not product_id:
-        return None
+        raise GlobusParseError(
+            f"globus PDP {page.url}: Product JSON-LD lacks name/sku "
+            f"(name={name!r}, sku={ld.get('sku')!r})"
+        )
 
     offer = ld.get("offers") or {}
     if isinstance(offer, list):
@@ -483,12 +581,18 @@ async def search(
     is currently a no-op here — see the module docstring's "store_pickup"
     section. Every result reflects the browser context's default branch.
 
-    Returns an empty list for a genuine zero-result search. Raises if the
-    results container itself never renders (a real failure, not "no
-    results") or if a bot-wall interstitial is detected and does not clear
-    (see `baumarkt_mcp.browser.wait_for_challenge_clear`) — Globus's own
-    HTML was not observed to be walled (see module docstring), so this is
-    a defensive path, not the expected one.
+    Returns an empty list only for a positively-rendered zero-result search
+    (the visibly rendered `.no-results-cms-page` block). A result container
+    with no cards is a parse error on the first page; an empty later page is
+    accepted only as the end of an already paginated result set. Raises
+    :class:`GlobusParseError` when a search page never reaches a recognized
+    ready state, or advertises result cards that then all fail to parse — a
+    markup change must never read as "no results" —
+    and `CaptchaRequired`/`ChallengeTimeout` if a bot-wall interstitial is
+    detected and does not clear (see
+    `baumarkt_mcp.browser.wait_for_challenge_clear`) — Globus's own HTML was
+    not observed to be walled (see module docstring), so this is a defensive
+    path, not the expected one.
     """
     if store is not None:
         log.warning(
@@ -497,49 +601,86 @@ async def search(
             store,
         )
 
+    def parse_search_page(
+        page_num: int, remaining: int
+    ) -> Callable[[Any, Response | None], Awaitable[tuple[list[Product], bool]]]:
+        async def parse(page: Any, response: Response | None) -> tuple[list[Product], bool]:
+            if response is not None and response.status >= 400:
+                raise GlobusParseError(
+                    f"globus search page {page_num} for {query!r} returned "
+                    f"HTTP {response.status}"
+                )
+            soup, empty = await _rendered_search_soup(
+                page, query=query, page_num=page_num
+            )
+            cards = soup.select(_SELECTORS["product_card"])
+            if empty:
+                return [], False  # visibly rendered zero-hit page
+            if not cards:
+                if page_num > 1:
+                    # The prior page advertised another page; an empty
+                    # later listing is the site's pagination terminator.
+                    return [], False
+                raise GlobusParseError(
+                    f"globus search page {page_num} for {query!r} rendered "
+                    "an empty results container without a visible "
+                    "no-results marker"
+                )
+
+            products: list[Product] = []
+            skipped = 0
+            for card in cards:
+                if len(products) >= remaining:
+                    break
+                try:
+                    product = _parse_listing_card(card)
+                except Exception:  # noqa: BLE001 - one bad card must not kill the page
+                    skipped += 1
+                    log.warning(
+                        "globus: skipping malformed search card", exc_info=True
+                    )
+                    continue
+                if product is None:
+                    skipped += 1
+                    continue
+                products.append(product)
+            if skipped:
+                log.warning(
+                    "globus: search page %d for %r: skipped %d unparseable "
+                    "result cards",
+                    page_num,
+                    query,
+                    skipped,
+                )
+            if not products:
+                # The page advertised cards and not one of them parsed —
+                # that is a markup change (or a degraded page), not "no
+                # results".
+                raise GlobusParseError(
+                    f"globus search page {page_num} for {query!r} rendered "
+                    f"{len(cards)} result cards but none parsed"
+                )
+
+            next_li = soup.select_one(_SELECTORS["pagination_next"])
+            next_classes = next_li.get("class") or [] if next_li else []
+            has_next = next_li is not None and "disabled" not in next_classes
+            return products, has_next
+
+        return parse
+
     results: list[Product] = []
     async with manager.context() as ctx:
-        page = await ctx.new_page()
-        try:
-            page_num = 1
-            while len(results) < max_results and page_num <= _MAX_SEARCH_PAGES:
-                url = _build_search_url(query, page_num)
-                await page.goto(
-                    url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
-                )
-                await wait_for_challenge_clear(page)
-                try:
-                    await page.wait_for_selector(
-                        _SELECTORS["results_container"], timeout=_RESULTS_TIMEOUT_MS
-                    )
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"globus search results never rendered for "
-                        f"query={query!r} (page {page_num})"
-                    ) from exc
-
-                html = await page.content()
-                soup = BeautifulSoup(html, "lxml")
-                cards = soup.select(_SELECTORS["product_card"])
-                if not cards:
-                    break  # genuine zero results (first page) or ran off the end
-
-                for card in cards:
-                    product = _parse_listing_card(card)
-                    if product is not None:
-                        results.append(product)
-                    if len(results) >= max_results:
-                        break
-                if len(results) >= max_results:
-                    break
-
-                next_li = soup.select_one(_SELECTORS["pagination_next"])
-                next_classes = next_li.get("class") or [] if next_li else []
-                if next_li is None or "disabled" in next_classes:
-                    break
-                page_num += 1
-        finally:
-            await page.close()
+        for page_num in range(1, _MAX_SEARCH_PAGES + 1):
+            if len(results) >= max_results:
+                break
+            products, has_next = await fetch_page(
+                ctx,
+                _build_search_url(query, page_num),
+                parse_search_page(page_num, max_results - len(results)),
+            )
+            results.extend(products)
+            if not has_next:
+                break
 
     return results[:max_results]
 
@@ -561,9 +702,13 @@ async def get_product(
     `store` is accepted for signature parity but currently a no-op — see
     the module docstring.
 
-    Returns `None` if the id does not resolve to a product at all (not
-    found), or if a resolved page unexpectedly carries no parseable
-    Product JSON-LD.
+    Returns `None` only when the id *positively* does not resolve to a
+    product: the result page renders its empty-state block, or renders
+    non-empty result cards none of which carries the id. A page that fails to
+    reach a recognized state, has an empty unmarked result container, or a
+    resolved PDP with no usable Product JSON-LD, raises
+    :class:`GlobusParseError` instead — "page did not render its product data"
+    is a failure, not "no such product".
     """
     if store is not None:
         log.warning(
@@ -572,50 +717,68 @@ async def get_product(
             store,
         )
 
-    async with manager.context() as ctx:
-        page = await ctx.new_page()
-        try:
-            lookup_url = _build_search_url(product_id)
-            await page.goto(
-                lookup_url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
+    async def resolve_pdp(page: Any, response: Response | None) -> str | None:
+        if response is not None and response.status >= 400:
+            raise GlobusParseError(
+                f"globus lookup for {product_id!r} returned HTTP {response.status}"
             )
-            await wait_for_challenge_clear(page)
+        if _looks_like_pdp_url(page.url):
+            # Unique-hit redirect: navigation already landed on the PDP.
+            return page.url
+        # Not a unique-hit redirect — look the id up in this page's own
+        # rendered result cards (same ready-state rules as search()).
+        soup, empty = await _rendered_search_soup(page, query=product_id, page_num=1)
+        if empty:
+            return None
+        cards = soup.select(_SELECTORS["product_card"])
+        if not cards:
+            raise GlobusParseError(
+                f"globus lookup for {product_id!r} rendered an empty results "
+                "container without a visible no-results marker"
+            )
+        card = next(
+            (
+                c
+                for c in cards
+                if c.get("data-product-id") == product_id
+            ),
+            None,
+        )
+        if card is None:
+            # Non-empty results rendered and this id simply isn't in them.
+            return None
+        link_el = card.select_one(_SELECTORS["product_link"])
+        raw_href = link_el.get("href") if link_el else None
+        href = raw_href if isinstance(raw_href, str) else ""
+        if not href or href != href.strip() or any(char.isspace() for char in href):
+            raise GlobusParseError(
+                f"globus result card for {product_id!r} carries no usable "
+                f"product link (href={href!r})"
+            )
+        pdp_url = urljoin(BASE_URL, href)
+        if not _looks_like_pdp_url(pdp_url):
+            # The card matching the requested id is there but its link is
+            # not a usable product page ("#", "javascript:", a non-PDP
+            # route) — a structural failure of a resolved match, not
+            # "no such product".
+            raise GlobusParseError(
+                f"globus result card for {product_id!r} carries no usable "
+                f"product link (href={href!r})"
+            )
+        return pdp_url
 
-            if not _looks_like_pdp_url(page.url):
-                # Not a unique-hit redirect — fall back to matching the id
-                # against this page's own rendered result cards.
-                try:
-                    await page.wait_for_selector(
-                        _SELECTORS["results_container"], timeout=_RESULTS_TIMEOUT_MS
-                    )
-                except Exception:
-                    return None  # results container never rendered - treat as not found
+    async def parse_pdp(page: Any, response: Response | None) -> Product:
+        if response is not None and response.status >= 400:
+            raise GlobusParseError(
+                f"globus PDP for {product_id!r} returned HTTP {response.status}"
+            )
+        return await _parse_pdp(page, product_id)
 
-                html = await page.content()
-                soup = BeautifulSoup(html, "lxml")
-                card = next(
-                    (
-                        c
-                        for c in soup.select(_SELECTORS["product_card"])
-                        if c.get("data-product-id") == product_id
-                    ),
-                    None,
-                )
-                if card is None:
-                    return None
-                link_el = card.select_one(_SELECTORS["product_link"])
-                href = link_el.get("href") if link_el else None
-                if not href or not isinstance(href, str):
-                    return None
-                pdp_url = urljoin(BASE_URL, href)
-                await page.goto(
-                    pdp_url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
-                )
-                await wait_for_challenge_clear(page)
-
-            return await _parse_pdp(page, product_id)
-        finally:
-            await page.close()
+    async with manager.context() as ctx:
+        pdp_url = await fetch_page(ctx, _build_search_url(product_id), resolve_pdp)
+        if pdp_url is None:
+            return None
+        return await fetch_page(ctx, pdp_url, parse_pdp)
 
 
 # --------------------------------------------------------------------------- #

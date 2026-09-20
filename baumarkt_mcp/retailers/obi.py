@@ -31,6 +31,7 @@ market, and never fabricate a branch code.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import urllib.parse
 from typing import Any
@@ -38,6 +39,8 @@ from typing import Any
 import httpx
 
 from baumarkt_mcp.models import Product, normalize_availability, parse_price
+
+log = logging.getLogger("baumarkt-mcp.retailers.obi")
 
 RETAILER = "obi"
 BASE_URL = "https://www.obi.de"
@@ -85,12 +88,54 @@ class ObiError(RuntimeError):
     """
 
 
-def _make_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        headers={"User-Agent": USER_AGENT},
-        follow_redirects=True,
-        timeout=DEFAULT_TIMEOUT,
-    )
+# Full browser-like header set for a plain-HTTP client — obi.de serves real
+# markup to a browser-shaped request, and a bare UA-only header set is the
+# classic "easy bot" tell even where it still works (measured-working UA,
+# 2026-08-06; the Accept value is what desktop Chrome sends for navigations).
+_BROWSER_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8,"
+        "application/signed-exchange;v=b3;q=0.7"
+    ),
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.6",
+}
+
+# One process-scoped client, shared by every obi call — a fresh client per
+# operation paid a fresh TCP/TLS handshake each time and, worse, looked to
+# the far end like a new "browser" per request. Created lazily on first use
+# (so the module stays usable outside the server lifespan) and closed from
+# the server lifespan's shutdown (see ``aclose``). Per-request timeouts stay
+# covered by the client-level default.
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(
+            headers=_BROWSER_HEADERS,
+            follow_redirects=True,
+            timeout=DEFAULT_TIMEOUT,
+        )
+    return _client
+
+
+async def start() -> None:
+    """Eagerly create the process-scoped client. Called once from the server
+    lifespan so startup owns the lifecycle; direct adapter callers that never
+    run the lifespan get the same client lazily via :func:`_get_client`."""
+    _get_client()
+
+
+async def aclose() -> None:
+    """Close the process-scoped client. Called from the server lifespan's
+    shutdown; idempotent, and the next request simply builds a new client."""
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None
 
 
 def _extract_initial_state(html: str) -> dict[str, Any]:
@@ -218,40 +263,50 @@ async def search(
     :class:`ObiError` when the page could not be fetched, or fetched but not
     trusted — a transport error, an unrecognised non-2xx response, or a 2xx
     page whose `__INITIAL_STATE__` blob is missing/unparseable/of
-    unexpected shape. Never lets one malformed result item fail the whole
-    call — such items are skipped.
+    unexpected shape, or a result list whose entries all failed to
+    normalise. Malformed individual entries are skipped (and logged), never
+    fatal while others parse.
     """
     query = query.strip()
     if not query or max_results <= 0:
         return []
 
     url = f"{BASE_URL}/search/{urllib.parse.quote(query, safe='')}/"
-    async with _make_client() as client:
-        try:
-            response = await client.get(url)
-        except httpx.HTTPError as exc:
-            raise ObiError(f"obi.de: search request failed: {exc}") from exc
-
-    if response.status_code not in (200, 404):
-        raise ObiError(f"obi.de: search returned HTTP {response.status_code}")
-
-    state = _extract_initial_state(response.text)
+    client = _get_client()
     try:
-        suche = state["pinia"]["suche"]
-    except (KeyError, TypeError) as exc:
-        raise ObiError(f"obi.de: unexpected __INITIAL_STATE__ shape: {exc}") from exc
+        response = await client.get(url)
+    except httpx.HTTPError as exc:
+        raise ObiError(f"obi.de: search request failed: {exc}") from exc
 
     if response.status_code == 404:
         # OBI serves a real HTTP 404 for a query with zero matches (not a
         # transport problem) — its own state blob names this explicitly.
         # Only trust that reading on this specific, recognised shape;
         # anything else on a 404 is treated as a genuine error.
-        error = suche.get("error") or {}
+        state = _extract_initial_state(response.text)
+        try:
+            error = state["pinia"]["suche"].get("error") or {}
+        except (KeyError, TypeError) as exc:
+            raise ObiError(
+                f"obi.de: unexpected __INITIAL_STATE__ shape: {exc}"
+            ) from exc
         if error.get("name") == "NullErgebnisSeiteError":
             return []
         raise ObiError(
             "obi.de: search returned HTTP 404 without a recognised no-results marker"
         )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise ObiError(
+            f"obi.de: search returned HTTP {response.status_code}"
+        ) from exc
+
+    state = _extract_initial_state(response.text)
+    try:
+        suche = state["pinia"]["suche"]
+    except (KeyError, TypeError) as exc:
+        raise ObiError(f"obi.de: unexpected __INITIAL_STATE__ shape: {exc}") from exc
 
     try:
         result_list = suche["suchergebnis"]["ergebnisListe"]
@@ -262,15 +317,33 @@ async def search(
         raise ObiError("obi.de: ergebnisListe was not a list")
 
     products: list[Product] = []
+    skipped = 0
     for item in result_list:
         if len(products) >= max_results:
             break
         try:
             product = _product_from_search_item(item)
         except Exception:  # noqa: BLE001 - one bad item must not sink the list
+            skipped += 1
+            log.warning("obi: skipping malformed search item", exc_info=True)
             continue
-        if product is not None:
-            products.append(product)
+        if product is None:
+            skipped += 1
+            continue
+        products.append(product)
+    if skipped:
+        log.warning(
+            "obi: search for %r: skipped %d unparseable result entries",
+            query,
+            skipped,
+        )
+    if not products and result_list:
+        # OBI returned entries and not one normalised — that is an
+        # unexpected payload shape, not a successful empty search.
+        raise ObiError(
+            f"obi.de: search for {query!r} returned {len(result_list)} "
+            "entries but none could be normalised"
+        )
     return products
 
 
@@ -410,26 +483,45 @@ async def get_product(product_id: str, *, store: str | None = None) -> Product |
     answers a bad/unknown numeric id with HTTP 400 or 404, observed
     2026-08-06, and never with a `Product` JSON-LD block in that case).
     Raises :class:`ObiError` for a transport failure or an unrecognised
-    non-2xx response, or a 2xx page with no parseable `Product` JSON-LD at
-    all -- distinct from "no such product".
+    non-2xx response, or for a 2xx page with no `Product` JSON-LD matching
+    this id, or one that fails to build a usable `Product` -- distinct from
+    "no such product".
     """
     product_id = product_id.strip()
     if not product_id:
         return None
 
     url = f"{BASE_URL}/p/{urllib.parse.quote(product_id, safe='')}"
-    async with _make_client() as client:
-        try:
-            response = await client.get(url)
-        except httpx.HTTPError as exc:
-            raise ObiError(f"obi.de: product request failed: {exc}") from exc
+    client = _get_client()
+    try:
+        response = await client.get(url)
+    except httpx.HTTPError as exc:
+        raise ObiError(f"obi.de: product request failed: {exc}") from exc
 
     if response.status_code in (400, 404):
+        # The recognised "no such product" answers — see docstring.
         return None
-    if response.status_code != 200:
-        raise ObiError(f"obi.de: product page returned HTTP {response.status_code}")
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise ObiError(
+            f"obi.de: product page returned HTTP {response.status_code}"
+        ) from exc
 
     data = _extract_product_ld_json(response.text, product_id)
     if data is None:
-        return None
-    return _product_from_ld_json(data, fallback_url=str(response.url))
+        # A 2xx detail page that resolves this id always carries a matching
+        # Product(ProductGroup-variant) JSON-LD block — its absence means a
+        # layout change or a degraded page, which must surface as an error
+        # rather than read as "no such product".
+        raise ObiError(
+            f"obi.de: product page for {product_id!r} returned HTTP "
+            f"{response.status_code} without a matching Product JSON-LD block"
+        )
+    product = _product_from_ld_json(data, fallback_url=str(response.url))
+    if product is None:
+        raise ObiError(
+            f"obi.de: Product JSON-LD for {product_id!r} lacks usable "
+            "sku/name fields"
+        )
+    return product

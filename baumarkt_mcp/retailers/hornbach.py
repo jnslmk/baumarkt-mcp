@@ -42,21 +42,32 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 from urllib.parse import quote
 
-from ..browser import (
-    BrowserManager,
-    CaptchaRequired,
-    ChallengeTimeout,
-    wait_for_challenge_clear,
-)
+from patchright.async_api import Response
+
+from ..browser import BrowserManager, fetch_page
 from ..models import Product, normalize_availability, parse_price
 
 log = logging.getLogger("baumarkt-mcp.retailers.hornbach")
 
 RETAILER = "hornbach"
 BASE_URL = "https://www.hornbach.de"
+
+
+class HornbachParseError(RuntimeError):
+    """hornbach.de served a page whose expected structure is missing.
+
+    Raised when a page that navigation delivered does not carry the data its
+    page type always carries (the JSON-LD blocks, an ``ItemList`` on a search
+    that is not a confirmed zero-hit, a ``Product`` block on a resolved
+    detail page). Deliberately distinct from a genuine zero-result search
+    (empty list) or an unknown sku (``None``) — a layout change or a soft
+    block page must surface as an error, never silently read as "nothing
+    found".
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -73,14 +84,25 @@ async def _extract_ldjson_objects(page: Any) -> list[dict]:
     Each script tag is parsed independently and a bad one is skipped with a
     warning rather than raising — one malformed block must never take down
     the whole search or product fetch.
+
+    Failure to *read* the script tags at all, though, is a structural
+    failure of the page, not one malformed block — it raises
+    :class:`HornbachParseError` instead of returning ``[]`` (which callers
+    would read as "no JSON-LD on this page type", i.e. a confirmed zero-hit
+    search or an unknown product). A page with genuinely zero JSON-LD blocks
+    still returns ``[]`` — that shape is how hornbach renders a confirmed
+    zero-hit search (measured live 2026-09-20: HTTP 200, title
+    "HORNBACH | <query> | 0-Treffer", no ld+json at all).
     """
     try:
         raw_texts = await page.locator(
             'script[type="application/ld+json"]'
         ).all_text_contents()
-    except Exception:  # noqa: BLE001 - defensive; page state can be odd mid-render
-        log.warning("hornbach: could not read JSON-LD script tags", exc_info=True)
-        return []
+    except Exception as exc:  # noqa: BLE001 - structural failure, not a bad block
+        raise HornbachParseError(
+            "hornbach: could not read JSON-LD script tags — page did not "
+            "render its expected structure"
+        ) from exc
 
     objects: list[dict] = []
     for text in raw_texts:
@@ -387,6 +409,47 @@ def _product_from_ldjson(
 
 
 # --------------------------------------------------------------------------- #
+# zero-hit / status classification
+# --------------------------------------------------------------------------- #
+
+# Measured live 2026-09-20: a zero-hit search returns HTTP 200 with the
+# title "HORNBACH | <query> | 0-Treffer" and no JSON-LD at all — that title
+# marker is the only positive "no results" signal hornbach gives.
+_NO_RESULTS_RE = re.compile(r"\b0[\s-]?treffer\b", re.IGNORECASE)
+
+
+async def _shows_no_results(page: Any) -> bool:
+    """True when hornbach positively renders a zero-hit search page.
+
+    Checked only when the expected ``ItemList`` JSON-LD is missing, so a
+    marker phrase appearing anywhere inside a healthy result page can never
+    misclassify it as empty. A missing ItemList *without* this marker is a
+    structural failure and raises :class:`HornbachParseError` in the caller.
+    """
+    try:
+        title = await page.title() or ""
+        text = await page.inner_text("body")
+    except Exception:  # noqa: BLE001 - an unreadable page proves nothing either way
+        return False
+    return bool(
+        _NO_RESULTS_RE.search(title) or _NO_RESULTS_RE.search(text)
+    )
+
+
+def _require_ok(response: Response | None, what: str) -> None:
+    """Raise unless the goto response reports a healthy page.
+
+    A resolved navigation is not a healthy page: hornbach's wall serves its
+    challenge with HTTP 200, and a 4xx/5xx on the *real* page type means the
+    fetch failed — it must surface as an error, never as "no results"/
+    "not found". (The one expected non-2xx, a 404 on an unknown sku, is
+    classified by the caller *before* calling this.)
+    """
+    if response is not None and response.status >= 400:
+        raise HornbachParseError(f"hornbach {what} returned HTTP {response.status}")
+
+
+# --------------------------------------------------------------------------- #
 # public adapter API
 # --------------------------------------------------------------------------- #
 
@@ -410,62 +473,72 @@ async def search(
     clear — deliberately not caught here, so a caller can tell "hit a bot
     wall" apart from "no results found" (an empty list).
 
-    Returns an empty list, not an error, when the page loads cleanly but
-    simply has no ``ItemList``/no matches for `query`.
+    Returns an empty list only when hornbach *positively* renders a zero-hit
+    page (the "0-Treffer" marker — see :func:`_shows_no_results`). A page
+    that fails to render its expected structure raises
+    :class:`HornbachParseError` instead — a layout change or a soft block
+    page must never read as "no matches".
     """
     # safe="" so a literal "/" in the query (ordinary hardware vocabulary,
     # e.g. "1/2 zoll rohr") is percent-encoded rather than surviving as an
     # extra path segment — quote()'s default safe="/" would silently split
     # the URL and turn a real query into an empty/garbage result.
     url = f"{BASE_URL}/s/{quote(query, safe='')}"
+
+    async def parse_search(page: Any, response: Response | None) -> list[Product]:
+        _require_ok(response, f"search page for {query!r}")
+
+        objects = await _extract_ldjson_objects(page)
+        item_list = _find_first_of_type(objects, "ItemList")
+        if item_list is None:
+            if await _shows_no_results(page):
+                log.info("hornbach: confirmed zero hits for query %r", query)
+                return []
+            raise HornbachParseError(
+                f"hornbach search page for {query!r} carries no ItemList "
+                "JSON-LD and shows no zero-hit marker"
+            )
+
+        elements = item_list.get("itemListElement")
+        if not isinstance(elements, list):
+            raise HornbachParseError(
+                f"hornbach search page for {query!r} has an ItemList whose "
+                f"itemListElement is {type(elements).__name__}, not a list"
+            )
+
+        results: list[Product] = []
+        for element in elements:
+            if len(results) >= max_results:
+                break
+            if not isinstance(element, dict):
+                continue
+            item = element.get("item")
+            if not isinstance(item, dict):
+                # Some ItemList shapes put the Product directly in the
+                # ListItem rather than nested under "item".
+                item = element
+            # Resolves a Product as-is, or a ProductGroup down to its
+            # first variant (no target sku to match against here — see
+            # _resolve_product_object). None for anything else (e.g. a
+            # plain dict that isn't either shape).
+            resolved = _resolve_product_object(item, target_sku=None)
+            if resolved is None:
+                continue
+            try:
+                product = _product_from_ldjson(
+                    resolved, fallback_url=None, store=store
+                )
+            except Exception:  # noqa: BLE001 - one bad item must not kill the search
+                log.warning(
+                    "hornbach: skipping malformed search result item", exc_info=True
+                )
+                continue
+            if product is not None:
+                results.append(product)
+        return results
+
     async with manager.context() as ctx:
-        page = await ctx.new_page()
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await wait_for_challenge_clear(page)
-
-            objects = await _extract_ldjson_objects(page)
-            item_list = _find_first_of_type(objects, "ItemList")
-            if item_list is None:
-                log.info("hornbach: no ItemList JSON-LD for query %r", query)
-                return []
-
-            elements = item_list.get("itemListElement")
-            if not isinstance(elements, list):
-                return []
-
-            results: list[Product] = []
-            for element in elements:
-                if len(results) >= max_results:
-                    break
-                if not isinstance(element, dict):
-                    continue
-                item = element.get("item")
-                if not isinstance(item, dict):
-                    # Some ItemList shapes put the Product directly in the
-                    # ListItem rather than nested under "item".
-                    item = element
-                # Resolves a Product as-is, or a ProductGroup down to its
-                # first variant (no target sku to match against here — see
-                # _resolve_product_object). None for anything else (e.g. a
-                # plain dict that isn't either shape).
-                resolved = _resolve_product_object(item, target_sku=None)
-                if resolved is None:
-                    continue
-                try:
-                    product = _product_from_ldjson(
-                        resolved, fallback_url=None, store=store
-                    )
-                except Exception:  # noqa: BLE001 - one bad item must not kill the search
-                    log.warning(
-                        "hornbach: skipping malformed search result item", exc_info=True
-                    )
-                    continue
-                if product is not None:
-                    results.append(product)
-            return results
-        finally:
-            await page.close()
+        return await fetch_page(ctx, url, parse_search)
 
 
 async def get_product(
@@ -492,9 +565,14 @@ async def get_product(
     :class:`~baumarkt_mcp.browser.ChallengeTimeout` if the bot wall does not
     clear — not caught here, same reasoning as `search`.
 
-    Returns ``None`` (not an error) for a sku hornbach doesn't recognise
-    (404, a page with no ``Product`` JSON-LD, or one whose JSON-LD fails to
-    parse into a `Product`) rather than raising.
+    Returns ``None`` (not an error) only for a sku hornbach positively
+    doesn't recognise — the HTTP 404 its detail route answers unknown skus
+    with (measured live 2026-09-20). Anything else short of a parsed
+    `Product` on the resolved page — a 2xx page with no ``Product``/``ProductGroup``
+    JSON-LD, or JSON-LD that does not resolve to a usable `Product` — raises
+    :class:`HornbachParseError`: a resolved detail page always carries its
+    Product block, so its absence means the page changed or the fetch was
+    degraded, and reporting that as "no such product" would be a lie.
     """
     if product_id.startswith("http://") or product_id.startswith("https://"):
         url = product_id
@@ -504,56 +582,42 @@ async def get_product(
         # malformed URL if it ever contains a "/".
         url = f"{BASE_URL}/p/-/{quote(product_id.strip(), safe='')}/"
 
-    async with manager.context() as ctx:
-        page = await ctx.new_page()
-        try:
-            response = await page.goto(
-                url, wait_until="domcontentloaded", timeout=30000
+    async def parse_product(page: Any, response: Response | None) -> Product | None:
+        if response is not None and response.status == 404:
+            # The one positive "no such product" signal: hornbach's detail
+            # route answers unknown skus with a real 404.
+            return None
+        _require_ok(response, f"detail page for {product_id!r}")
+
+        objects = await _extract_ldjson_objects(page)
+        product_obj = _find_first_of_type(objects, "Product")
+        if product_obj is None:
+            # Not seen live on hornbach (see _resolve_product_object's
+            # docstring), but fall back to a ProductGroup wrapper
+            # defensively rather than reporting a real product as
+            # missing.
+            group_obj = _find_first_of_type(objects, "ProductGroup")
+            if group_obj is not None:
+                target_sku = (
+                    _sku_from_url(product_id)
+                    if url == product_id
+                    else product_id.strip()
+                )
+                product_obj = _resolve_product_object(group_obj, target_sku)
+        if product_obj is None:
+            raise HornbachParseError(
+                f"hornbach detail page for {product_id!r} (HTTP "
+                f"{response.status if response is not None else '??'}) carries "
+                "no Product/ProductGroup JSON-LD"
             )
-            await wait_for_challenge_clear(page)
 
-            if response is not None and response.status == 404:
-                return None
+        product = _product_from_ldjson(product_obj, fallback_url=page.url, store=store)
+        if product is None:
+            raise HornbachParseError(
+                f"hornbach Product JSON-LD for {product_id!r} does not "
+                "resolve to a usable Product (missing name/url/sku)"
+            )
+        return product
 
-            objects = await _extract_ldjson_objects(page)
-            product_obj = _find_first_of_type(objects, "Product")
-            if product_obj is None:
-                # Not seen live on hornbach (see _resolve_product_object's
-                # docstring), but fall back to a ProductGroup wrapper
-                # defensively rather than reporting a real product as
-                # missing.
-                group_obj = _find_first_of_type(objects, "ProductGroup")
-                if group_obj is not None:
-                    target_sku = (
-                        _sku_from_url(product_id)
-                        if url == product_id
-                        else product_id.strip()
-                    )
-                    product_obj = _resolve_product_object(group_obj, target_sku)
-            if product_obj is None:
-                log.info(
-                    "hornbach: no Product/ProductGroup JSON-LD for product_id %r",
-                    product_id,
-                )
-                return None
-
-            try:
-                return _product_from_ldjson(
-                    product_obj, fallback_url=page.url, store=store
-                )
-            except (CaptchaRequired, ChallengeTimeout):
-                # Cannot actually be raised by _product_from_ldjson (it never
-                # touches the page), but re-raised explicitly rather than
-                # falling into the broad except below so a future change
-                # can't accidentally start swallowing a bot-wall failure
-                # into a misleading "not found".
-                raise
-            except Exception:  # noqa: BLE001 - must not raise; see docstring
-                log.warning(
-                    "hornbach: failed to parse Product JSON-LD for product_id %r",
-                    product_id,
-                    exc_info=True,
-                )
-                return None
-        finally:
-            await page.close()
+    async with manager.context() as ctx:
+        return await fetch_page(ctx, url, parse_product)

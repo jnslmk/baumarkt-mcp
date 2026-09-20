@@ -241,9 +241,13 @@ async def lifespan(_: FastMCP) -> AsyncIterator[None]:
     _browser = BrowserManager()
     _browser_gate = asyncio.Semaphore(MAX_CONCURRENT)
     await _browser.start()
+    # obi's httpx client is process-scoped too — one per process, closed on
+    # shutdown (see obi.aclose), never a fresh client per operation.
+    await obi.start()
     try:
         yield
     finally:
+        await obi.aclose()
         await _browser.close()
         _browser = None
         _browser_gate = None
