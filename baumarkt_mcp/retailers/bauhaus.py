@@ -506,6 +506,7 @@ async def _purchasability_from_responses(
                 availability = _bool_to_availability(bool(purchasable))
             elif kind == "STORE" and is_store_scoped and store_pickup is None:
                 store_pickup = bool(purchasable)
+    # `and responses` is load-bearing: empty list must fall through to (None, None), unlike the :714 sibling whose empty case is pre-rejected.
     if parse_failures == len(responses) and responses:
         raise BauhausParseError(
             f"bauhaus: captured {len(responses)} /api/purchasability "
